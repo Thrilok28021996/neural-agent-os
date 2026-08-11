@@ -1,0 +1,47 @@
+[package]
+name = "neural-agent-os"
+version = "0.1.0"
+description = "Local-first personal assistant"
+authors = ["Neural Agent OS"]
+edition = "2021"
+default-run = "neural-agent-os"
+
+[lib]
+name = "neural_agent_os_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "neural-cli"
+path = "src/cli.rs"
+
+[[bin]]
+name = "neural-agent-os"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2.2", features = [] }
+
+[dependencies]
+tauri = { version = "2.5", features = [] }
+tauri-plugin-opener = "2.2"
+tauri-plugin-notification = "2.3"
+tauri-plugin-dialog = "2.2"
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rusqlite = { version = "0.32", features = ["bundled", "functions"] }
+walkdir = "2.5"
+uuid = { version = "1", features = ["v4"] }
+pdf-extract = "0.7"
+zip = "2.2"
+quick-xml = "0.37"
+reqwest = { version = "0.12", features = ["blocking", "json", "multipart"] }
+chrono = "0.4"
+keyring = "3.6"
+cron = "0.15"
+tiny_http = "0.12"
+imap = "2.4"
+native-tls = "0.2"
+mailparse = "0.15"
+sha2 = "0.10"
+rand = "0.8"

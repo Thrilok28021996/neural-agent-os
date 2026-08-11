@@ -1,0 +1,75 @@
+# Neural Agent OS + Vexa Meeting Bot — Docker Compose
+#
+# Vexa (https://vexa.ai, Apache 2.0) handles meeting bots for
+# Google Meet, Microsoft Teams, and Zoom.
+# Neural Agent OS provides the local-first desktop assistant.
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f vexa
+#
+# Vexa API: http://localhost:8445
+# Neural API: http://localhost:8787
+
+version: "3.8"
+
+services:
+  # Vexa — Open-source meeting bot (Google Meet, Teams, Zoom)
+  vexa:
+    image: ghcr.io/vexa-ai/vexa:latest
+    container_name: neural-vexa
+    restart: unless-stopped
+    ports:
+      - "8445:8445"
+    volumes:
+      - vexa-data:/data
+    environment:
+      # Google Meet OAuth (optional — only if using Google Meet bots)
+      - GOOGLE_CLIENT_ID=${NEURAL_GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${NEURAL_GOOGLE_CLIENT_SECRET:-}
+      # Microsoft Teams OAuth (optional — only if using Teams bots)
+      - MICROSOFT_CLIENT_ID=${NEURAL_MICROSOFT_CLIENT_ID:-}
+      - MICROSOFT_CLIENT_SECRET=${NEURAL_MICROSOFT_CLIENT_SECRET:-}
+      # Storage
+      - DATABASE_URL=postgresql://neural:neural@postgres:5432/vexa
+      - REDIS_URL=redis://redis:6379
+      # API
+      - VEXA_API_PORT=8445
+      - WEBHOOK_URL=http://host.docker.internal:8787/vexa/webhook
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # PostgreSQL for Vexa storage
+  postgres:
+    image: postgres:16-alpine
+    container_name: neural-postgres
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=neural
+      - POSTGRES_PASSWORD=neural
+      - POSTGRES_DB=vexa
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U neural -d vexa"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Redis for Vexa job queue
+  redis:
+    image: redis:7-alpine
+    container_name: neural-redis
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+
+volumes:
+  vexa-data:
+  postgres-data:
+  redis-data:
