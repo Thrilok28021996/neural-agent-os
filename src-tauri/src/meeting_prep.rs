@@ -30,10 +30,11 @@ pub struct KnowledgeSnippet {
 /// Generate a meeting preparation briefing.
 /// Gathers related emails, open action items, and relevant knowledge.
 pub fn prepare_meeting(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     connection: &Connection,
     event_id: &str,
 ) -> Result<MeetingPrep, String> {
+    log::info!("meeting_prep::prepare_meeting: enter");
     let (workspace_id, title, starts_at): (String, String, String) = connection
         .query_row(
             "SELECT workspace_id, title, starts_at FROM calendar_events WHERE id = ?1",

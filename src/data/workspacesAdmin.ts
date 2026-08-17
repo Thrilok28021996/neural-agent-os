@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 import type { Workspace } from './workspaces'
 
 export function createWorkspace(name: string) {

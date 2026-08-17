@@ -38,6 +38,7 @@ pub struct AuditEntry {
 
 /// Get comprehensive storage statistics
 pub fn get_storage_stats(app: &tauri::AppHandle) -> Result<StorageStats, String> {
+    log::debug!("retention::get_storage_stats: enter");
     let connection = super::open_database(app)?;
     let db_path = super::database_path(app)?;
     let db_size = std::fs::metadata(&db_path)
@@ -47,7 +48,7 @@ pub fn get_storage_stats(app: &tauri::AppHandle) -> Result<StorageStats, String>
     // Gather recording info
     let mut stmt = connection
         .prepare(
-            "SELECT id, title, recording_path, created_at, status
+            "SELECT id, title, recording_path, started_at, status
              FROM meetings WHERE recording_path IS NOT NULL",
         )
         .map_err(|e| e.to_string())?;
@@ -116,13 +117,14 @@ pub fn cleanup_old_recordings(
     older_than_days: i64,
     dry_run: bool,
 ) -> Result<Vec<String>, String> {
+    log::info!("retention::cleanup_old_recordings: enter");
     let connection = super::open_database(app)?;
     let cutoff = chrono::Utc::now() - chrono::Duration::days(older_than_days);
 
     let mut stmt = connection
         .prepare(
             "SELECT id, title, recording_path FROM meetings
-             WHERE recording_path IS NOT NULL AND created_at < ?1",
+             WHERE recording_path IS NOT NULL AND COALESCE(started_at, created_at) < ?1",
         )
         .map_err(|e| e.to_string())?;
 
@@ -167,6 +169,7 @@ pub fn record_audit(
     workspace_id: Option<&str>,
     details: &str,
 ) -> Result<(), String> {
+    log::info!("retention::record_audit: enter");
     let id = format!("audit-{}", uuid::Uuid::new_v4());
     connection
         .execute(
@@ -184,6 +187,7 @@ pub fn get_audit_log(
     workspace_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<AuditEntry>, String> {
+    log::debug!("retention::get_audit_log: enter");
     let sql = match workspace_id {
         Some(_) => "SELECT id, created_at, action, provider, data_type, workspace_id, details
                     FROM audit_log WHERE workspace_id = ?1 ORDER BY created_at DESC LIMIT ?2",
@@ -235,6 +239,7 @@ pub fn schedule_backup(
     workspace_id: &str,
     destination_path: &str,
 ) -> Result<String, String> {
+    log::info!("retention::schedule_backup: enter");
     let destination = std::path::PathBuf::from(destination_path);
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -266,16 +271,49 @@ pub fn schedule_backup(
 
 /// Validate backup integrity
 pub fn validate_backup(path: &str) -> Result<bool, String> {
+    log::debug!("retention::validate_backup: enter");
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let parsed: Result<serde_json::Value, _> = serde_json::from_str(&content);
     match parsed {
-        Ok(json) => {
-            let valid = json.get("version").is_some()
-                && json.get("workspace_id").is_some()
-                && json.get("exported_at").is_some();
-            Ok(valid)
+        Err(parse_error) => {
+            log::warn!("retention::validate_backup: invalid JSON in {path}: {parse_error}");
+            Ok(false)
         }
-        Err(_) => Ok(false),
+        Ok(json) => {
+            let version = json.get("version").and_then(|v| v.as_u64()).unwrap_or(0);
+            if version == 0 || json.get("workspace_id").is_none() || json.get("exported_at").is_none() {
+                log::warn!("retention::validate_backup: {path} missing required fields (version={version})");
+                return Ok(false);
+            }
+            // v2 archives must carry an integrity hash and per-domain counts.
+            if version >= 2 {
+                if json.get("content_hash").and_then(|v| v.as_str()).map(|h| h.is_empty()).unwrap_or(true) {
+                    log::warn!("retention::validate_backup: {path} is v2 but has no content hash");
+                    return Ok(false);
+                }
+                if json.get("row_counts").map(|v| !v.is_object()).unwrap_or(true) {
+                    log::warn!("retention::validate_backup: {path} is v2 but has no row_counts");
+                    return Ok(false);
+                }
+                // Recompute the canonical hash (content_hash blanked) and compare.
+                let mut canonical = json.clone();
+                if let Some(obj) = canonical.as_object_mut() {
+                    obj.insert("content_hash".into(), serde_json::Value::String(String::new()));
+                }
+                let canonical_bytes = serde_json::to_vec(&canonical).unwrap_or_default();
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(&canonical_bytes);
+                let computed = format!("{:x}", hasher.finalize());
+                let embedded = json.get("content_hash").and_then(|v| v.as_str()).unwrap_or("");
+                if computed != embedded {
+                    log::warn!("retention::validate_backup: {path} content hash mismatch (embedded {embedded}, computed {computed})");
+                    return Ok(false);
+                }
+            }
+            log::info!("retention::validate_backup: {path} OK (version={version})");
+            Ok(true)
+        }
     }
 }
 
@@ -287,6 +325,7 @@ pub fn differential_backup(
     destination_path: &str,
     since: &str,
 ) -> Result<String, String> {
+    log::info!("retention::differential_backup: enter");
     let destination = std::path::PathBuf::from(destination_path);
     if let Some(parent) = destination.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -382,6 +421,7 @@ pub fn get_workspace_retention(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Option<i64>, String> {
+    log::debug!("retention::get_workspace_retention: enter");
     connection
         .query_row(
             "SELECT CAST(value AS INTEGER) FROM app_settings WHERE key = ?1",
@@ -401,6 +441,7 @@ pub fn set_workspace_retention(
     workspace_id: &str,
     retention_days: i64,
 ) -> Result<(), String> {
+    log::info!("retention::set_workspace_retention: enter");
     connection
         .execute(
             "INSERT INTO app_settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

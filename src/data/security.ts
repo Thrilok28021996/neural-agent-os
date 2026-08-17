@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 // ── Agent-controlled command/file execution (permission + approval gated) ──
 

@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type EmailAccount = { id: string; workspace_id: string; provider: string; account_label: string; imap_host?: string; smtp_host?: string; status: string }
 export function connectEmailAccount(workspaceId: string, provider: 'gmail' | 'outlook' | 'imap', accountLabel: string, imapHost?: string, smtpHost?: string) { return invoke<EmailAccount>('connect_email_account', { workspaceId, provider, accountLabel, imapHost, smtpHost }) }

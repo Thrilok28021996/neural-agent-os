@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type RecordingStatus = { active: boolean; path?: string; meeting_id?: string; queued?: boolean }
 export type RecordingDecision = { allowed: boolean; action: string; reason: string }

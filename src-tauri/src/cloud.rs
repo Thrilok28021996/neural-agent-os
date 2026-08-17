@@ -33,7 +33,9 @@ pub fn cloud_transcribe(
     model: &str,
     api_key: &str,
     workspace_id: &str,
+    language: &str,
 ) -> Result<CloudTranscriptionResult, String> {
+    log::info!("cloud::cloud_transcribe: meeting={meeting_id} provider={provider} model={model} language={language} audio={recording_path} workspace={workspace_id}");
     // Cost limit enforcement before cloud API call
     let limit = super::costs::get_cost_limit(connection, workspace_id, "transcription")?;
     if let Some(limit_cents) = limit {
@@ -76,12 +78,15 @@ pub fn cloud_transcribe(
     let result = match provider {
         "openai" => transcribe_openai(recording_path, model, api_key),
         "anthropic" => Err("Anthropic does not provide a transcription API. Use OpenAI or a local Whisper runtime.".into()),
-        "google" => transcribe_google(recording_path, api_key),
+        "google" => transcribe_google(recording_path, api_key, language),
         _ => Err(format!("Unsupported cloud transcription provider: {provider}")),
     };
 
     match result {
         Ok(segments) => {
+            if !language.trim().is_empty() {
+                let _ = connection.execute("UPDATE meetings SET language = ?1 WHERE id = ?2", params![language, meeting_id]);
+            }
             connection
                 .execute(
                     "DELETE FROM transcript_segments WHERE meeting_id = ?1",
@@ -217,16 +222,32 @@ fn transcribe_openai(path: &str, model: &str, api_key: &str) -> Result<Vec<Segme
     }
 }
 
-fn transcribe_google(path: &str, api_key: &str) -> Result<Vec<Segment>, String> {
+/// Map the app's language codes (en/hi/te) to Google Speech API BCP-47 codes.
+fn google_language_code(language: &str) -> String {
+    match language.trim() {
+        "hi" => "hi-IN".into(),
+        "te" => "te-IN".into(),
+        "" | "en" => "en-US".into(),
+        other => other.into(), // pass through full BCP-47 codes like "kn-IN"
+    }
+}
+
+fn transcribe_google(path: &str, api_key: &str, language: &str) -> Result<Vec<Segment>, String> {
     let audio_data = std::fs::read(path).map_err(|e| format!("Cannot read audio file: {e}"))?;
     let encoded = base64_encode_bytes(&audio_data);
 
+    let language_code = google_language_code(language);
+    // Alternative languages: every supported code except the primary one.
+    let alternatives: Vec<&str> = ["hi-IN", "te-IN", "en-US"]
+        .into_iter()
+        .filter(|code| *code != language_code)
+        .collect();
     let body = serde_json::json!({
         "config": {
             "encoding": encoding_for_path(path),
             "sampleRateHertz": 16000,
-            "languageCode": "en-US",
-            "alternativeLanguageCodes": ["hi-IN", "te-IN"],
+            "languageCode": language_code,
+            "alternativeLanguageCodes": alternatives,
             "enableAutomaticPunctuation": true,
             "enableWordTimestamps": true,
             "model": "latest_long"

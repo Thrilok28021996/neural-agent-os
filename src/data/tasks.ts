@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type Task = { id: string; workspace_id: string; title: string; due_at?: string; status: string }
 

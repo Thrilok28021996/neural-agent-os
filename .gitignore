@@ -1,0 +1,22 @@
+
+# Tauri updater signing keys (keep private)
+.tauri-keys/
+
+# SpeechBrain/pyannote model cache (downloaded at runtime by scripts/diarize.py)
+pretrained_models/
+.pytest_cache/
+
+# Build output & dependencies (must never be tracked)
+src-tauri/target/
+node_modules/
+dist/
+coverage/
+src-tauri/gen/schemas/
+*.dmg
+*.app
+*.tar.gz
+src-tauri/target/release/bundle/
+
+# Editors / OS
+.DS_Store
+*.pyc

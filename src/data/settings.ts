@@ -9,7 +9,7 @@ export type LocalSettings = {
 
 const settingsKey = 'neural-agent-os.settings'
 const defaults: LocalSettings = {
-  dataDirectory: 'Choose a local folder',
+  dataDirectory: '~/Neural Agent OS',
   recordingMode: 'confirm',
   recordingNotice: true,
   allowCloudAudio: false,

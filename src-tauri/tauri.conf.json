@@ -44,12 +44,15 @@
           "libayatana-appindicator3-1"
         ]
       }
-    }
+    },
+    "createUpdaterArtifacts": true
   },
   "plugins": {
     "updater": {
-      "endpoints": [],
-      "pubkey": "",
+      "endpoints": [
+        "https://updates.neural-agent.os/{{target}}/{{arch}}/{{current_version}}"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEE3QzE4MUY0NUY3NkJFN0QKUldSOXZuWmY5SUhCcDR4V1Z6a2E0RFA5R2dubWllVW9MeUw4S0tKM1dSVXBNdWtBa1lXSW51WVoK",
       "windows": {
         "installMode": "passive"
       }

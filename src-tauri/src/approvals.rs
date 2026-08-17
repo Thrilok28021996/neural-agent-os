@@ -7,7 +7,7 @@ pub struct ApprovalRequest {
     pub id: String,
     pub agent_id: String,
     pub workspace_id: String,
-    pub capability: String, // send_email, modify_calendar, delete_data, execute_command, edit_files
+    pub capability: String, // send_email, schedule_events, delete_data, execute_command, edit_files
     pub action_description: String,
     pub payload_json: String,
     pub status: String, // pending, approved, denied, expired
@@ -25,6 +25,7 @@ pub fn request_approval(
     description: &str,
     payload: &serde_json::Value,
 ) -> Result<ApprovalRequest, String> {
+    log::info!("approvals::request_approval: enter");
     let id = format!("approval-{}", uuid::Uuid::new_v4());
     let now = Utc::now().to_rfc3339();
 
@@ -69,6 +70,7 @@ pub fn approve_request(
     request_id: &str,
     approved_by: &str,
 ) -> Result<ApprovalRequest, String> {
+    log::info!("approvals::approve_request: enter");
     let now = Utc::now().to_rfc3339();
     let changed = connection.execute(
         "UPDATE approval_requests SET status = 'approved', resolved_at = ?1, resolved_by = ?2
@@ -110,6 +112,7 @@ pub fn deny_request(
     denied_by: &str,
     reason: &str,
 ) -> Result<(), String> {
+    log::info!("approvals::deny_request: enter");
     let now = Utc::now().to_rfc3339();
     let changed = connection.execute(
         "UPDATE approval_requests SET status = 'denied', resolved_at = ?1, resolved_by = ?2
@@ -134,6 +137,7 @@ pub fn list_pending_approvals(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<ApprovalRequest>, String> {
+    log::debug!("approvals::list_pending_approvals: enter");
     let mut stmt = connection.prepare(
         "SELECT id, agent_id, workspace_id, capability, action_description, payload_json, status,
          requested_at, resolved_at, resolved_by
@@ -164,6 +168,7 @@ pub fn check_and_request_approval(
     description: &str,
     payload: &serde_json::Value,
 ) -> Result<Option<ApprovalRequest>, String> {
+    log::debug!("approvals::check_and_request_approval: enter");
     // Check if the agent has explicit permission
     let perm = super::permissions::check_permission(connection, agent_id, workspace_id, capability);
 
@@ -175,7 +180,7 @@ pub fn check_and_request_approval(
     // Check if this is a capability that always requires approval
     let always_requires = matches!(
         capability,
-        "send_email" | "modify_calendar" | "delete_data" | "execute_commands" | "modify_files" | "draft_email"
+        "send_email" | "schedule_events" | "delete_data" | "execute_commands" | "modify_files" | "draft_email"
     );
 
     if !always_requires && super::permissions::check_permission(connection, agent_id, workspace_id, "read_knowledge").allowed {
@@ -195,6 +200,7 @@ pub fn has_approval(
     workspace_id: &str,
     capability: &str,
 ) -> Result<bool, String> {
+    log::debug!("approvals::has_approval: enter");
     let count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM approval_requests
          WHERE agent_id = ?1 AND workspace_id = ?2 AND capability = ?3
@@ -207,6 +213,7 @@ pub fn has_approval(
 
 /// Expire old pending approvals
 pub fn expire_old_approvals(connection: &Connection) -> Result<usize, String> {
+    log::info!("approvals::expire_old_approvals: enter");
     let changed = connection.execute(
         "UPDATE approval_requests SET status = 'expired', resolved_at = CURRENT_TIMESTAMP
          WHERE status = 'pending' AND requested_at < datetime('now', '-24 hours')",

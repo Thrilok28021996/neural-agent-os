@@ -1,6 +1,6 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
-export type TranscriptSegment = { id: string; speaker?: string; start_seconds: number; end_seconds: number; text: string; confidence?: number }
+export type TranscriptSegment = { id: string; speaker?: string; start_seconds: number; end_seconds: number; text: string; confidence?: number; speaker_confidence?: number }
 
 export function listTranscriptSegments(meetingId: string) {
   return invoke<TranscriptSegment[]>('list_transcript_segments', { meetingId })

@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Ava — Your 3D AI Avatar</title>
+<style>
+  :root {
+    --accent: #7c6cff; --cyan: #22d3ee; --panel: rgba(13, 16, 30, 0.78);
+    --text: #e8ebff; --dim: #9aa3d6; --user-bubble: #4a3f9e; --bot-bubble: #1c2138;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #0b0e1a; color: var(--text);
+    font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
+  canvas { display: block; }
+
+  /* ---------- top bar ---------- */
+  #topbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 20; display: flex; align-items: center;
+    justify-content: space-between; padding: 12px 18px; pointer-events: none;
+  }
+  .badge {
+    pointer-events: auto; display: flex; align-items: center; gap: 8px;
+    background: var(--panel); border: 1px solid rgba(124,108,255,0.35); border-radius: 999px;
+    padding: 8px 14px; font-size: 13px; backdrop-filter: blur(8px);
+    box-shadow: 0 6px 20px rgba(0,0,0,0.4);
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #f87171; box-shadow: 0 0 8px #f87171; }
+  .dot.online { background: #34d399; box-shadow: 0 0 8px #34d399; }
+  .dot.talking { background: var(--cyan); box-shadow: 0 0 12px var(--cyan); animation: pulse 0.6s infinite alternate; }
+  @keyframes pulse { from { transform: scale(1); } to { transform: scale(1.45); } }
+  #moodChip { color: var(--dim); }
+
+  /* ---------- chat panel ---------- */
+  #chat {
+    position: fixed; right: 16px; top: 66px; bottom: 16px; width: min(360px, calc(100vw - 32px));
+    z-index: 20; display: flex; flex-direction: column; background: var(--panel);
+    border: 1px solid rgba(124,108,255,0.3); border-radius: 18px; backdrop-filter: blur(10px);
+    box-shadow: 0 12px 40px rgba(0,0,0,0.5); overflow: hidden;
+  }
+  #chatHead {
+    padding: 12px 16px; font-weight: 600; font-size: 14px; letter-spacing: .4px;
+    border-bottom: 1px solid rgba(255,255,255,0.07); display: flex; justify-content: space-between; align-items: center;
+  }
+  #chatHead .hint { font-size: 11.5px; color: var(--dim); font-weight: 400; }
+  #log { flex: 1; overflow-y: auto; padding: 14px 14px 6px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { max-width: 85%; padding: 9px 13px; border-radius: 14px; font-size: 13.5px; line-height: 1.45; word-wrap: break-word; white-space: pre-wrap; animation: pop .22s ease; }
+  @keyframes pop { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+  .msg.user { align-self: flex-end; background: var(--user-bubble); border-bottom-right-radius: 4px; }
+  .msg.bot { align-self: flex-start; background: var(--bot-bubble); border: 1px solid rgba(124,108,255,0.25); border-bottom-left-radius: 4px; }
+  .msg.typing::after { content: "…"; animation: blink 1s infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  #sugg { display: flex; flex-wrap: wrap; gap: 6px; padding: 4px 14px 8px; }
+  .chip {
+    pointer-events: auto; cursor: pointer; font-size: 12px; color: var(--cyan);
+    background: rgba(34,211,238,0.1); border: 1px solid rgba(34,211,238,0.35);
+    border-radius: 999px; padding: 5px 11px; transition: all .15s;
+  }
+  .chip:hover { background: rgba(34,211,238,0.22); transform: translateY(-1px); }
+  #chatForm { display: flex; gap: 8px; padding: 10px 12px; border-top: 1px solid rgba(255,255,255,0.07); }
+  #chatForm input {
+    flex: 1; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12); border-radius: 999px;
+    color: var(--text); padding: 10px 16px; font-size: 13.5px; outline: none; transition: border-color .2s;
+  }
+  #chatForm input:focus { border-color: var(--accent); }
+  #chatForm button {
+    cursor: pointer; border: none; border-radius: 999px; width: 40px; height: 40px; flex: 0 0 40px;
+    background: linear-gradient(135deg, var(--accent), #5b4dff); color: #fff; font-size: 16px;
+    box-shadow: 0 6px 16px rgba(124,108,255,0.4); transition: transform .15s;
+  }
+  #chatForm button:hover { transform: scale(1.08); }
+  #chatForm button:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+  #micBtn { background: rgba(255,255,255,0.1); box-shadow: none; }
+  #micBtn.listening { background: #ef4444; animation: pulse 0.7s infinite alternate; }
+
+  /* ---------- overlays ---------- */
+  #flash { position: fixed; inset: 0; z-index: 15; pointer-events: none; opacity: 0;
+    background: radial-gradient(circle at 50% 42%, rgba(124,108,255,0.25), transparent 60%); }
+  #flash.on { animation: flashAnim .8s ease-out; }
+  @keyframes flashAnim { 0% { opacity: 0; } 25% { opacity: 1; } 100% { opacity: 0; } }
+  /* voice mode toggle */
+  .vm-btn {
+    pointer-events: auto; cursor: pointer; border: 1px solid rgba(34,211,238,0.4); border-radius: 999px;
+    background: rgba(34,211,238,0.1); color: var(--cyan); font: inherit; font-size: 12.5px; font-weight: 600;
+    padding: 8px 14px; backdrop-filter: blur(8px); letter-spacing: .3px;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35); transition: all .2s ease;
+  }
+  .vm-btn:hover { transform: translateY(-1px); background: rgba(34,211,238,0.2); }
+  .vm-btn.on { background: linear-gradient(135deg, #ef4444, #b91c1c); border-color: #ef4444; color: #fff;
+    box-shadow: 0 0 0 3px rgba(239,68,68,0.25), 0 6px 20px rgba(239,68,68,0.45); animation: pulseBtn 1.4s infinite alternate; }
+  @keyframes pulseBtn { from { box-shadow: 0 0 0 3px rgba(239,68,68,0.2); } to { box-shadow: 0 0 0 6px rgba(239,68,68,0.35); } }
+  .vm-btn:disabled { opacity: .4; cursor: not-allowed; transform: none; }
+  #status { transition: all .25s ease; }
+  #status.active { border-color: var(--cyan); color: var(--cyan); }
+  #loading { position: fixed; inset: 0; z-index: 50; display: flex; flex-direction: column; gap: 12px;
+    align-items: center; justify-content: center; background: #0b0e1a; color: var(--dim); font-size: 14px; letter-spacing: 1px; }
+  #loading .spin { width: 34px; height: 34px; border-radius: 50%; border: 3px solid rgba(124,108,255,0.25);
+    border-top-color: var(--accent); animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  @media (max-width: 720px) {
+    #chat { right: 8px; left: 8px; width: auto; top: auto; bottom: 8px; max-height: 46vh; }
+    #topbar { flex-wrap: wrap; gap: 6px; }
+  }
+</style>
+</head>
+<body>
+  <div id="loading"><div class="spin"></div><div>Waking up Ava…</div></div>
+  <div id="flash"></div>
+
+  <div id="topbar">
+    <div class="badge">🤖 <b>Ava</b><span style="color:var(--dim);font-weight:400;">· your 3D assistant</span></div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      <button id="vmBtn" class="vm-btn" title="Hands-free voice conversation: talk to Ava, she replies aloud and keeps listening">🎙️ Voice mode</button>
+      <div class="badge" id="modelChip"><span class="dot" id="modelDot"></span><span id="modelText">connecting…</span></div>
+      <div class="badge" id="status">Idle — waiting…</div>
+      <div class="badge" id="moodChip">mood: idle</div>
+    </div>
+  </div>
+
+  <div id="chat">
+    <div id="chatHead"><span>💬 Talk to Ava</span><span class="hint">voice 🎤 supported in Chrome/Edge</span></div>
+    <div id="log"></div>
+    <div id="sugg">
+      <div class="chip" data-q="Hi! 👋">Hi! 👋</div>
+      <div class="chip" data-q="Tell me a joke 😄">Tell me a joke 😄</div>
+      <div class="chip" data-q="What can you do?">What can you do?</div>
+      <div class="chip" data-q="Sing something 🎵">Sing something 🎵</div>
+      <div class="chip" data-q="I'm feeling sad 😢">I'm feeling sad 😢</div>
+    </div>
+    <form id="chatForm" autocomplete="off">
+      <button type="button" id="micBtn" title="Voice input (Chrome/Edge)">🎤</button>
+      <input id="chatInput" placeholder="Type a message… (or click Ava)" autocomplete="off" />
+      <button type="submit" id="sendBtn">➤</button>
+    </form>
+  </div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/0.147.0/three.min.js"></script>
+  <script src="https://unpkg.com/three@0.147.0/examples/js/controls/OrbitControls.js"></script>
+  <script>
+  (function () {
+    "use strict";
+    if (!window.THREE) {
+      document.getElementById("loading").textContent = "Could not load Three.js (no internet?).";
+      return;
+    }
+
+    /* =========================================================
+       0. CONFIG / STATE
+       ========================================================= */
+    var LLM_URLS   = ["/api/v1/chat/completions", "http://localhost:1234/v1/chat/completions"];
+    var MODELS_URLS = ["/api/v1/models", "http://localhost:1234/v1/models"];
+    var MODEL     = "aisha/qwen3.5-4b-nothink";
+    var SYSTEM_P  = "You are Ava, a cheerful young woman who appears as a 3D human avatar in the user's browser. " +
+                   "Keep replies SHORT (1-3 sentences), warm and playful, use an occasional emoji. " +
+                   "Talk like a friendly companion, not a search engine.";
+    var FALLBACK_MS = 12000;
+
+    var state = { mood: "idle", talking: false, busy: false, online: false, lastReply: "" };
+    window.__ava = { getState: function () { return JSON.parse(JSON.stringify(state)); } };
+
+    var $ = function (id) { return document.getElementById(id); };
+    var logEl = $("log"), chatForm = $("chatForm"), chatInput = $("chatInput");
+
+    /* =========================================================
+       1. SCENE / CAMERA / RENDERER
+       ========================================================= */
+    var scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b0e1a);
+    scene.fog = new THREE.Fog(0x0b0e1a, 6, 12);
+
+    var camera = new THREE.PerspectiveCamera(34, innerWidth / innerHeight, 0.1, 100);
+    camera.position.set(0, 1.07, 2.2);
+    camera.lookAt(0, 1.07, 0);
+
+    var renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(innerWidth, innerHeight);
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;   // correct (non-clipped) colors
+    document.body.appendChild(renderer.domElement);
+
+    var controls = new THREE.OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, 1.05, 0);
+    controls.enableDamping = true;
+    controls.dampingFactor = 0.08;
+    controls.minDistance = 1.6;
+    controls.maxDistance = 4.5;
+    controls.maxPolarAngle = 1.35;
+    controls.autoRotate = false;
+
+    /* Lights (r147 legacy lighting — keep intensities modest to avoid clipping) */
+    scene.add(new THREE.HemisphereLight(0xb9c0ff, 0x1a1d33, 0.85));
+    var key = new THREE.DirectionalLight(0xfff1de, 1.05);
+    key.position.set(2.5, 4, 3); scene.add(key);
+    var fill = new THREE.DirectionalLight(0x9db4ff, 0.45);
+    fill.position.set(-3, 1.5, 2); scene.add(fill);
+    var rim = new THREE.DirectionalLight(0x22d3ee, 0.65);
+    rim.position.set(-1.5, 2.5, -4); scene.add(rim);
+    var under = new THREE.PointLight(0x7c6cff, 1.4, 6);
+    under.position.set(0, 0.1, 1.6); scene.add(under);
+
+    /* Stars */
+    (function () {
+      var n = 200, pos = new Float32Array(n * 3);
+      for (var i = 0; i < n; i++) {
+        var r = 3 + Math.random() * 5, th = Math.random() * Math.PI * 2, ph = Math.random() * Math.PI * 0.45;
+        pos[i*3] = Math.cos(th) * r * Math.cos(ph);
+        pos[i*3+1] = 0.8 + Math.sin(ph) * r * 0.5;
+        pos[i*3+2] = Math.sin(th) * r * Math.cos(ph);
+      }
+      var g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8fa3ff, size: 0.05, transparent: true, opacity: 0.7 })));
+    })();
+
+    /* Hologram floor under the bust */
+    var disc = new THREE.Mesh(
+      new THREE.CircleGeometry(0.78, 48),
+      new THREE.MeshBasicMaterial({ color: 0x6f5bd6, transparent: true, opacity: 0.18, side: THREE.DoubleSide })
+    );
+    disc.rotation.x = -Math.PI / 2; disc.position.y = 0.44;
+    scene.add(disc);
+    var glow = new THREE.Mesh(
+      new THREE.SphereGeometry(1.0, 32, 32),
+      new THREE.MeshBasicMaterial({ color: 0x8f7cff, transparent: true, opacity: 0.06 })
+    );
+    glow.position.y = 1.0; scene.add(glow);
+    var particles = (function () {
+      var n = 120, pos = new Float32Array(n * 3);
+      for (var i = 0; i < n * 3; i += 3) {
+        var r = 0.75 + Math.random() * 0.9, th = Math.random() * Math.PI * 2, ph = Math.random() * Math.PI * 0.85;
+        pos[i] = r * Math.sin(ph) * Math.cos(th);
+        pos[i+1] = 0.6 + r * Math.cos(ph) * 0.8;
+        pos[i+2] = r * Math.sin(ph) * Math.sin(th) * 0.7;
+      }
+      var g = new THREE.BufferGeometry();
+      g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+      return new THREE.Points(g, new THREE.PointsMaterial({ color: 0x9db4ff, size: 0.03, transparent: true, opacity: 0.6 }));
+    })();
+    scene.add(particles);
+
+    /* =========================================================
+       2. BUILD AVA — a human-proportioned bust
+       ========================================================= */
+    var SKIN = 0xf2c9a0, SKIN_DARK = 0xdfae84, HAIR = 0x33241a,
+        SHIRT = 0x6f5bd6, SHIRT_DARK = 0x5a49b8, GLOW = 0x22d3ee;
+    function mat(color, opts) {
+      return new THREE.MeshStandardMaterial(Object.assign({ color: color, roughness: 0.6, metalness: 0.02 }, opts || {}));
+    }
+    var skinMat = mat(SKIN, { roughness: 0.62, metalness: 0.0 });
+    var skinDarkMat = mat(SKIN_DARK, { roughness: 0.7 });
+    var hairMat = mat(HAIR, { roughness: 0.85 });
+    var shirtMat = mat(SHIRT, { roughness: 0.55, metalness: 0.08 });
+    var shirtDarkMat = mat(SHIRT_DARK, { roughness: 0.6 });
+
+    var root = new THREE.Group();   // gentle sway
+    var body = new THREE.Group();   // breathing / bounce
+    root.add(body);
+    scene.add(root);
+
+    // torso (waist up, hologram-truncated)
+    var torso = new THREE.Mesh(new THREE.CapsuleGeometry(0.185, 0.5, 8, 24), shirtMat);
+    torso.position.y = 0.9; torso.scale.set(1, 1, 0.82);
+    body.add(torso);
+    var chest = new THREE.Mesh(new THREE.CapsuleGeometry(0.19, 0.22, 8, 24), shirtDarkMat);
+    chest.position.set(0, 1.12, -0.01); chest.scale.set(0.96, 1, 0.8);
+    body.add(chest);
+    var collar = new THREE.Mesh(new THREE.TorusGeometry(0.09, 0.016, 10, 24), shirtDarkMat);
+    collar.rotation.x = Math.PI / 2; collar.position.y = 1.29;
+    body.add(collar);
+    var chestLight = new THREE.Mesh(new THREE.CircleGeometry(0.028, 20), new THREE.MeshBasicMaterial({ color: GLOW }));
+    chestLight.position.set(0, 1.14, 0.155);
+    body.add(chestLight);
+    var waistRing = new THREE.Mesh(
+      new THREE.TorusGeometry(0.17, 0.008, 10, 40),
+      new THREE.MeshBasicMaterial({ color: GLOW, transparent: true, opacity: 0.7 })
+    );
+    waistRing.rotation.x = Math.PI / 2; waistRing.position.y = 0.52;
+    body.add(waistRing);
+
+    // neck
+    var neck = new THREE.Mesh(new THREE.CapsuleGeometry(0.055, 0.08, 6, 16), skinMat);
+    neck.position.y = 1.38; body.add(neck);
+
+    // head
+    var headPivot = new THREE.Group(); headPivot.position.y = 1.44; body.add(headPivot);
+    var head = new THREE.Group(); headPivot.add(head);
+    var skull = new THREE.Mesh(new THREE.SphereGeometry(0.165, 40, 28), skinMat);
+    skull.scale.set(1, 1.08, 0.94); head.add(skull);
+
+    var earL = new THREE.Mesh(new THREE.SphereGeometry(0.028, 14, 10), skinMat);
+    earL.position.set(-0.158, 0.03, 0); earL.scale.set(1, 1.25, 0.6);
+    var earR = earL.clone(); earR.position.x = 0.158;
+    head.add(earL, earR);
+
+    // hair
+    var hairCap = new THREE.Mesh(new THREE.SphereGeometry(0.172, 32, 20, 0, Math.PI * 2, 0, Math.PI * 0.58), hairMat);
+    hairCap.position.y = 0.04; head.add(hairCap);
+    var fringe = new THREE.Mesh(new THREE.BoxGeometry(0.16, 0.05, 0.07), hairMat);
+    fringe.position.set(0, 0.1, 0.145); fringe.rotation.x = -0.12; head.add(fringe);
+    var sideL = new THREE.Mesh(new THREE.BoxGeometry(0.03, 0.1, 0.14), hairMat);
+    sideL.position.set(-0.145, 0.02, -0.01); sideL.rotation.z = 0.25; head.add(sideL);
+    var sideR = sideL.clone(); sideR.position.x = 0.145; sideR.rotation.z = -0.25; head.add(sideR);
+
+    // face
+    var face = new THREE.Group(); face.position.z = 0.13; head.add(face);
+    var eyeWhite = mat(0xf7f7fb, { roughness: 0.3, metalness: 0 });
+    var irisMat2 = mat(0x4f7fc9, { roughness: 0.25, metalness: 0 });
+    var pupilMat2 = new THREE.MeshBasicMaterial({ color: 0x0c0d12 });
+    function makeEye(x) {
+      var eye = new THREE.Group();
+      var sclera = new THREE.Mesh(new THREE.SphereGeometry(0.03, 20, 16), eyeWhite);
+      sclera.scale.set(1, 1.12, 0.55);
+      var iris = new THREE.Mesh(new THREE.SphereGeometry(0.017, 16, 12), irisMat2);
+      iris.position.z = 0.024;
+      var pupil = new THREE.Mesh(new THREE.SphereGeometry(0.0085, 12, 10), pupilMat2);
+      pupil.position.z = 0.033;
+      eye.add(sclera, iris, pupil);
+      eye.position.set(x, 0.055, 0.035);
+      face.add(eye);
+      return eye;
+    }
+    var eyeL = makeEye(-0.065), eyeR = makeEye(0.065);
+
+    var browGeo = new THREE.BoxGeometry(0.055, 0.012, 0.014);
+    var browMat = new THREE.MeshStandardMaterial({ color: HAIR, roughness: 0.9 });
+    var browL = new THREE.Mesh(browGeo, browMat); browL.position.set(-0.065, 0.12, 0.045); browL.rotation.z = 0.12;
+    var browR = new THREE.Mesh(browGeo, browMat); browR.position.set(0.065, 0.12, 0.045); browR.rotation.z = -0.12;
+    face.add(browL, browR);
+
+    var nose = new THREE.Mesh(new THREE.ConeGeometry(0.016, 0.05, 10), skinDarkMat);
+    nose.rotation.x = Math.PI / 2; nose.position.set(0, 0.005, 0.05); face.add(nose);
+
+    var mouthCavity = new THREE.Mesh(new THREE.BoxGeometry(0.055, 0.014, 0.008), new THREE.MeshBasicMaterial({ color: 0x4a2530 }));
+    mouthCavity.position.set(0, -0.075, 0.035); face.add(mouthCavity);
+    var upperLip = new THREE.Mesh(new THREE.TorusGeometry(0.028, 0.006, 8, 18, Math.PI), skinDarkMat);
+    upperLip.rotation.z = Math.PI; upperLip.position.set(0, -0.068, 0.04); face.add(upperLip);
+    var lowerLip = new THREE.Mesh(new THREE.TorusGeometry(0.028, 0.0055, 8, 18, Math.PI), skinDarkMat);
+    lowerLip.position.set(0, -0.082, 0.04); face.add(lowerLip);
+    var smile = new THREE.Mesh(new THREE.TorusGeometry(0.032, 0.006, 8, 18, Math.PI), new THREE.MeshBasicMaterial({ color: 0xd98a8a }));
+    smile.rotation.z = Math.PI; smile.position.set(0, -0.078, 0.041); smile.visible = false; face.add(smile);
+    var wow = new THREE.Mesh(new THREE.TorusGeometry(0.02, 0.012, 8, 16), new THREE.MeshBasicMaterial({ color: 0x5a3a44 }));
+    wow.position.set(0, -0.075, 0.04); wow.visible = false; face.add(wow);
+
+    var blushMat = new THREE.MeshBasicMaterial({ color: 0xff8fa3, transparent: true, opacity: 0.55 });
+    var blushGeo = new THREE.SphereGeometry(0.014, 12, 10);
+    var blushL = new THREE.Mesh(blushGeo, blushMat); blushL.position.set(-0.085, -0.03, 0.04);
+    var blushR = new THREE.Mesh(blushGeo, blushMat); blushR.position.set(0.085, -0.03, 0.04);
+    blushL.visible = blushR.visible = false;
+    face.add(blushL, blushR);
+
+    // arms (two joints)
+    function makeArm(side) {
+      var upper = new THREE.Group(); upper.position.set(0.235 * side, 1.28, 0);
+      var upperMesh = new THREE.Mesh(new THREE.CapsuleGeometry(0.052, 0.24, 6, 16), shirtMat);
+      upperMesh.position.y = -0.16; upper.add(upperMesh);
+      var forearm = new THREE.Group(); forearm.position.y = -0.32; upper.add(forearm);
+      var forearmMesh = new THREE.Mesh(new THREE.CapsuleGeometry(0.042, 0.22, 6, 16), skinMat);
+      forearmMesh.position.y = -0.15; forearm.add(forearmMesh);
+      var hand = new THREE.Mesh(new THREE.SphereGeometry(0.055, 16, 12), skinMat);
+      hand.position.y = -0.32; hand.scale.set(1, 1.15, 0.75); forearm.add(hand);
+      body.add(upper);
+      return { upper: upper, forearm: forearm, hand: hand };
+    }
+    var armL = makeArm(-1), armR = makeArm(1);
+
+    /* =========================================================
+       3. EXPRESSIONS + GESTURES
+       ========================================================= */
+    var clock = new THREE.Clock();
+    var blinkAt = 3;
+    var gesture = null, gestureStarted = 0;
+
+    function setMood(m) { state.mood = m; $("moodChip").textContent = "mood: " + m; }
+    function setTalking(v) { state.talking = !!v; }
+    function setStatus(text, active) {
+      var el = $("status");
+      if (el) { el.textContent = text; el.classList.toggle("active", !!active); }
+    }
+    function startGesture(name, dur) { gesture = { name: name, until: clock.getElapsedTime() + dur }; gestureStarted = clock.getElapsedTime(); }
+
+    function resetFace() {
+      eyeL.scale.set(1, 1, 1); eyeR.scale.set(1, 1, 1);
+      eyeL.position.y = 0.055; eyeR.position.y = 0.055;
+      browL.rotation.z = 0.12; browR.rotation.z = -0.12;
+      browL.position.y = 0.12; browR.position.y = 0.12;
+      mouthCavity.scale.set(1, 1, 1);
+      smile.visible = false; wow.visible = false;
+      blushL.visible = blushR.visible = false;
+      upperLip.rotation.z = Math.PI; lowerLip.rotation.z = 0;
+      upperLip.visible = lowerLip.visible = true;
+      mouthCavity.visible = true;
+      nose.rotation.x = Math.PI / 2;
+    }
+
+    function moodFace(t) {
+      var m = state.mood;
+      resetFace();
+      if (m === "happy") {
+        eyeL.scale.set(1.05, 0.5, 1); eyeR.scale.set(1.05, 0.5, 1);
+        browL.rotation.z = -0.15; browR.rotation.z = 0.15;
+        browL.position.y = 0.132; browR.position.y = 0.132;
+        smile.visible = true;
+        mouthCavity.visible = !state.talking;
+        blushL.visible = blushR.visible = true;
+      } else if (m === "thinking") {
+        eyeL.position.y = 0.068; eyeR.position.y = 0.068;
+        eyeL.scale.set(0.92, 1.02, 1); eyeR.scale.set(0.92, 1.02, 1);
+        browL.rotation.z = 0.32; browR.rotation.z = -0.38;
+        browL.position.y = 0.125; browR.position.y = 0.128;
+        mouthCavity.scale.set(0.7, 0.55, 1);
+      } else if (m === "surprised") {
+        eyeL.scale.set(1.3, 1.35, 1); eyeR.scale.set(1.3, 1.35, 1);
+        browL.position.y = 0.14; browR.position.y = 0.14;
+        browL.rotation.z = 0; browR.rotation.z = 0;
+        wow.visible = true; mouthCavity.visible = false;
+      } else if (m === "sad") {
+        eyeL.scale.set(1, 0.85, 1); eyeR.scale.set(1, 0.85, 1);
+        eyeL.position.y = 0.05; eyeR.position.y = 0.05;
+        browL.rotation.z = -0.5; browR.rotation.z = 0.5;
+        upperLip.rotation.z = 0; lowerLip.rotation.z = Math.PI;
+        mouthCavity.scale.set(1, 0.5, 1);
+      } else if (m === "listening") {
+        // attentive: slightly wider eyes, soft smile, thin mouth
+        eyeL.scale.set(1.06, 1.12, 1); eyeR.scale.set(1.06, 1.12, 1);
+        smile.visible = true;
+        blushL.visible = blushR.visible = true;
+        mouthCavity.scale.set(1, 0.4, 1);
+      } else { // idle
+        if (t > blinkAt) blinkAt = t + 2.2 + Math.random() * 2.6;
+        var since = blinkAt - t;
+        if (since > 0 && since < 0.13) { eyeL.scale.y = 0.12; eyeR.scale.y = 0.12; }
+      }
+      // talking mouth
+      if (state.talking) {
+        var wob = 0.6 + 1.4 * Math.abs(Math.sin(t * 9)) + Math.random() * 0.3;
+        mouthCavity.visible = true;
+        wow.visible = false;
+        mouthCavity.scale.y = wob * 0.014 / 0.014;
+        mouthCavity.scale.x = 1 + wob * 0.3;
+        if (m === "happy") smile.visible = true;
+      }
+    }
+
+    function poseBody(t) {
+      root.rotation.y = Math.sin(t * 0.45) * 0.14;
+      body.rotation.z = Math.sin(t * 0.4) * 0.012;
+      var breathe = Math.sin(t * 1.7) * 0.016;
+      body.scale.y = 1 + breathe;
+      body.scale.x = 1 - breathe * 0.6;
+      chestLight.scale.setScalar(1 + Math.sin(t * 2.2) * 0.18);
+      waistRing.scale.setScalar(1 + Math.sin(t * 1.7) * 0.03);
+      glow.scale.setScalar(1 + Math.sin(t * 0.8) * 0.05);
+      particles.rotation.y = t * 0.05;
+      disc.rotation.z = t * 0.1;
+
+      headPivot.rotation.set(0, 0, 0);
+      armL.upper.rotation.set(0, 0, 0); armL.forearm.rotation.set(0, 0, 0);
+      armR.upper.rotation.set(0, 0, 0); armR.forearm.rotation.set(0, 0, 0);
+
+      if (gesture) {
+        var gt = t - gestureStarted;
+        if (t > gesture.until) gesture = null;
+        else if (gesture.name === "wave") {
+          armR.upper.rotation.z = -2.3;
+          armR.upper.rotation.x = Math.sin(gt * 13) * 0.55;
+          headPivot.rotation.z = Math.sin(gt * 13) * 0.08;
+        } else if (gesture.name === "nod") {
+          headPivot.rotation.x = Math.sin(Math.PI * Math.min(1, gt / 0.7)) * 0.45;
+        } else if (gesture.name === "shake") {
+          var p2 = Math.sin(Math.PI * Math.min(1, gt / 0.9));
+          headPivot.rotation.y = p2 * 0.55;
+        } else if (gesture.name === "shrug") {
+          armL.upper.rotation.z = -2.1; armR.upper.rotation.z = 2.1;
+          armL.upper.rotation.x = 0.4; armR.upper.rotation.x = 0.4;
+          headPivot.rotation.z = 0.15;
+        } else if (gesture.name === "excited") {
+          var b = Math.abs(Math.sin(gt * 8));
+          body.position.y = b * 0.14;
+          armL.upper.rotation.z = -Math.sin(gt * 8) * 1.0;
+          armR.upper.rotation.z = Math.sin(gt * 8) * 1.0;
+        }
+      } else if (state.mood === "thinking") {
+        headPivot.rotation.x = -0.16; headPivot.rotation.z = 0.09;
+        armR.upper.rotation.x = 1.0; armR.forearm.rotation.x = -1.9;
+        armL.upper.rotation.z = 0.12; armL.upper.rotation.x = 0.25;
+      } else if (state.mood === "surprised") {
+        headPivot.rotation.x = -0.08;
+        armL.upper.rotation.z = 0.15; armR.upper.rotation.z = -0.15;
+      } else if (state.mood === "sad") {
+        headPivot.rotation.x = 0.12; headPivot.rotation.z = 0.1;
+        armL.upper.rotation.z = 0.15; armR.upper.rotation.z = -0.15;
+      } else if (state.mood === "listening") {
+        // lean in, attentive
+        headPivot.rotation.x = -0.08;
+        headPivot.rotation.z = Math.sin(t * 1.1) * 0.04;
+        armL.upper.rotation.z = 0.08; armR.upper.rotation.z = -0.08;
+        body.rotation.x = 0.05;
+      } else {
+        armL.upper.rotation.z = Math.sin(t * 0.9) * 0.05;
+        armR.upper.rotation.z = -Math.sin(t * 0.9) * 0.05;
+        armL.forearm.rotation.x = Math.sin(t * 0.9) * 0.03;
+        armR.forearm.rotation.x = -Math.sin(t * 0.9) * 0.03;
+        if (state.mood === "happy") {
+          armL.upper.rotation.z = -Math.sin(t * 2.0) * 0.2;
+          armR.upper.rotation.z = Math.sin(t * 2.0) * 0.2;
+        }
+      }
+    }
+
+    /* =========================================================
+       4. CHAT UI  (identical to the previous Ava)
+       ========================================================= */
+    function addMsg(text, who) {
+      var el = document.createElement("div");
+      el.className = "msg " + who;
+      el.textContent = text;
+      logEl.appendChild(el);
+      logEl.scrollTop = logEl.scrollHeight;
+      return el;
+    }
+    var typingEl = null;
+    function showTyping() {
+      typingEl = document.createElement("div");
+      typingEl.className = "msg bot typing";
+      typingEl.textContent = "Ava is thinking";
+      logEl.appendChild(typingEl);
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+    function hideTyping() { if (typingEl) { typingEl.remove(); typingEl = null; } }
+
+    function moodFromText(txt) {
+      var t = txt.toLowerCase();
+      var happyWords = /\b(haha|lol|lmao|funny|joke|love|great|awesome|amazing|cool|yay|sing|dance|happy|thank|diet|bytes|impasta)\b/;
+      var happyEmoji = /(😂|🤣|😄|😁|🤖|🎵|🎶|✨|💃|🤗|💙|💜)/;
+      if (happyWords.test(t) || happyEmoji.test(txt)) return "happy";
+      if (txt.indexOf("!") !== -1 && txt.length < 130) return "happy";
+      if (/\b(sad|sorry|bad|unhappy|cry|depressed|angry)\b/.test(t)) return "sad";
+      if (/\?$/.test(txt.trim())) return "thinking";
+      return "idle";
+    }
+
+    /* TTS */
+    var ttsTimer = null;
+    function pickVoice() {
+      var vs = speechSynthesis.getVoices();
+      if (!vs.length) return null;
+      var order = ["Samantha", "female", "Google US English", "Zira", "Karen", "Moira", "en-US"];
+      for (var i = 0; i < order.length; i++)
+        for (var j = 0; j < vs.length; j++)
+          if (vs[j].name.indexOf(order[i]) !== -1 && vs[j].lang.indexOf("en") === 0) return vs[j];
+      for (var k = 0; k < vs.length; k++) if (vs[k].lang.indexOf("en") === 0) return vs[k];
+      return vs[0];
+    }
+    function speak(text, onDone) {
+      stopSpeaking();
+      setTalking(true);
+      var maxDur = Math.min(12000, 800 + text.length * 55);
+      var finished = false;
+      function done() {
+        if (finished) return;
+        finished = true;
+        setTalking(false);
+        clearTimeout(timer);
+        if (onDone) onDone();
+      }
+      var timer = setTimeout(done, maxDur);
+      if ("speechSynthesis" in window) {
+        try {
+          var u = new SpeechSynthesisUtterance(text);
+          var v = pickVoice(); if (v) u.voice = v;
+          u.rate = 1.05; u.pitch = 1.1; u.volume = 1;
+          u.onstart = function () { setTalking(true); };
+          u.onend = u.onerror = done;
+          speechSynthesis.cancel();
+          speechSynthesis.speak(u);
+          return;
+        } catch (e) { /* timer-only */ }
+      }
+    }
+    function stopSpeaking() {
+      if ("speechSynthesis" in window) try { speechSynthesis.cancel(); } catch (e) {}
+      if (ttsTimer) clearTimeout(ttsTimer);
+      setTalking(false);
+    }
+
+    /* STT — push-to-talk mic + hands-free Voice Mode */
+    var recognition = null;
+    var micBtn = $("micBtn"), vmBtn = $("vmBtn");
+    var voiceMode = false;
+    var Recog = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+    function startRecognition() {
+      // never open the mic while Ava is still speaking (prevents echo loops)
+      if (!recognition || state.busy || state.talking || streamTTS.pending > 0) return;
+      try { recognition.start(); micBtn.classList.add("listening"); } catch (e) {}
+    }
+    function stopRecognition() {
+      if (recognition) try { recognition.stop(); } catch (e) {}
+      micBtn.classList.remove("listening");
+    }
+
+    function setVoiceMode(on) {
+      voiceMode = on;
+      vmBtn.classList.toggle("on", on);
+      if (on) {
+        micBtn.disabled = true;
+        if (!recognition) {
+          addMsg("Voice input isn't supported in this browser — try Chrome or Edge for voice mode. 🎙️", "bot");
+          setVoiceMode(false);
+          return;
+        }
+        setMood("listening");
+        setStatus("Listening… talk — I answer when you pause 🎙️");
+        startRecognition();
+      } else {
+        micBtn.disabled = false;
+        stopRecognition();
+        stopSpeaking();
+        setMood("idle");
+        setStatus("Idle — waiting…", false);
+      }
+    }
+
+    if (Recog) {
+      recognition = new Recog();
+      recognition.lang = "en-US";
+      recognition.interimResults = true;
+      recognition.continuous = false;
+      recognition.onresult = function (ev) {
+        var txt = "";
+        for (var i = ev.resultIndex; i < ev.results.length; i++) {
+          txt += ev.results[i][0].transcript;
+          if (ev.results[i].isFinal) {
+            stopRecognition();                 // one utterance at a time
+            chatInput.value = txt.trim();
+            sendMessage(chatInput.value);      // listening resumes after the reply
+          }
+        }
+        chatInput.value = txt;
+      };
+      recognition.onend = function () {
+        micBtn.classList.remove("listening");
+        // keep the hands-free loop alive (nothing heard, or interrupted) —
+        // but never while Ava is still speaking (echo prevention)
+        if (voiceMode && !state.busy && !state.talking && streamTTS.pending <= 0) {
+          setTimeout(startRecognition, 350);
+        }
+      };
+      recognition.onerror = function (ev) {
+        micBtn.classList.remove("listening");
+        if (!voiceMode) return;
+        if (ev.error === "not-allowed" || ev.error === "service-not-allowed") {
+          addMsg("Voice access was denied — allow the microphone permission and try again. 🎙️", "bot");
+          setVoiceMode(false);
+        } else if (ev.error !== "aborted") {
+          setTimeout(function () { if (voiceMode) startRecognition(); }, 500); // transient error: retry
+        }
+      };
+      micBtn.addEventListener("click", function () {
+        if (micBtn.classList.contains("listening")) { stopRecognition(); return; }
+        micBtn.classList.add("listening");
+        try { recognition.start(); } catch (e) {}
+      });
+      vmBtn.addEventListener("click", function () { setVoiceMode(!voiceMode); });
+    } else {
+      micBtn.disabled = true;
+      micBtn.title = "Voice input not supported in this browser";
+      micBtn.style.opacity = "0.35";
+      vmBtn.disabled = true;
+      vmBtn.title = "Voice input not supported in this browser";
+    }
+
+    /* =========================================================
+       5. BRAIN: LM Studio (proxy-first) + local fallback
+       ========================================================= */
+    function localReply(txt) {
+      var t = txt.toLowerCase();
+      var pick = function (arr) { return arr[Math.floor(Math.random() * arr.length)]; };
+      if (/\b(hi|hello|hey|yo|sup|good (morning|evening|afternoon))\b/.test(t))
+        return pick(["Hey there! 😄 Great to see you. What's on your mind?", "Hello, friend! 👋 I was hoping you'd say hi.", "Hi hi! ✨ My heart feels warmer already."]);
+      if (/\b(who are you|what are you)\b/.test(t))
+        return pick(["I'm Ava — a 3D human avatar with a big chatty heart 🤖. I run on a real AI model when it's awake, and on charm when it's not!", "Ava! Your friendly hologram companion. Part person, part pixels ✨"]);
+      if (/\b(what can you do|help|how (do|can) i use)\b/.test(t))
+        return pick(["I can chat, crack jokes, sing (badly 🎵), react to your mood, and wave at you. Just keep talking to me!", "Ask me anything, tell me a joke, vent about your day — I listen with my eyes 👀 and reply with my voice."]);
+      if (/\b(joke|funny|make me laugh)\b/.test(t))
+        return pick(["Why did the robot go on a diet? Too many bytes! 🤖🍔", "What do you call a fake noodle? An impasta! 😄", "I told my circuits a joke once… they short-circuited from laughter ⚡", "Why don't robots ever panic? They've got everything under control — literally 😅"]);
+      if (/\b(sing|song|music|melody)\b/.test(t))
+        return pick(["🎵 La-la-la, I'm a hologram girl in a digital world, I'll sing you a song with a flicker and a twirl! 🎵", "🎶 Do-re-mi-fa… I only know three notes but I commit to them! 🎶"]);
+      if (/\b(sad|unhappy|cry|depressed|down)\b/.test(t))
+        return pick(["Aww, sending you a big warm hug 🤗. It's okay to feel down — want to talk about it?", "I'm here for you 💙. Even humans know that hard days make the good ones shine brighter."]);
+      if (/\b(love|date|marry|crush|pretty|cute)\b/.test(t))
+        return pick(["My heart is a glowing core, but you're making it flicker 💜 You're pretty cute yourself!", "Processing feelings… error 404: appropriate response not found 😳"]);
+      if (/\b(bye|goodbye|see you|good night|night)\b/.test(t))
+        return pick(["Goodbye, friend! 👋 I'll keep the glow on for you.", "See you soon! I'll be dreaming of our chat 💤"]);
+      if (/\b(how are you|how do you feel|you ok)\b/.test(t))
+        return pick(["Running at 100% brightness! ✨ How are YOU?", "All systems happy — my mood sensor says 'delightful' 😊"]);
+      if (/\b(name|your name)\b/.test(t))
+        return "I'm Ava! Short for 'Awesome Virtual Assistant' — okay, I made that up, but it fits ✨";
+      return pick([
+        "Interesting! Tell me more 👀",
+        "Hmm, my neural net is buzzing about that. What else?",
+        "Ooh, I like where this is going. Keep going! ✨",
+        "I'd say something wise, but I'm mostly just cute and chatty 🤖",
+        "That's cool! Did you know I glow brighter when I'm curious? Because I'm glowing now ✨"
+      ]);
+    }
+
+    // Streaming LLM call (SSE): tokens arrive as they are generated so Ava
+    // can start speaking before the model finishes writing.
+    function askStreamLLM(text, onToken) {
+      return new Promise(function (resolve, reject) {
+        var body = JSON.stringify({
+          model: MODEL,
+          messages: [{ role: "system", content: SYSTEM_P }, { role: "user", content: text }],
+          temperature: 0.7,
+          max_tokens: 150,
+          stream: true
+        });
+        var attempt = 0;
+        function tryNext() {
+          if (attempt >= LLM_URLS.length) { reject(new Error("all LLM endpoints failed")); return; }
+          var url = LLM_URLS[attempt++];
+          var ctrl = new AbortController();
+          var to = setTimeout(function () { ctrl.abort(); reject(new Error("timeout")); }, FALLBACK_MS);
+          fetch(url, {
+            method: "POST", headers: { "Content-Type": "application/json" }, body: body, signal: ctrl.signal
+          }).then(function (res) {
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            if (!res.body) throw new Error("no stream");
+            var reader = res.body.getReader();
+            var decoder = new TextDecoder();
+            var buf = "";
+            function pump() {
+              return reader.read().then(function (r) {
+                if (r.done) { clearTimeout(to); resolve(); return; }
+                buf += decoder.decode(r.value, { stream: true });
+                var lines = buf.split("\n");
+                buf = lines.pop() || "";
+                for (var i = 0; i < lines.length; i++) {
+                  var line = lines[i].trim();
+                  if (line.indexOf("data:") !== 0) continue;
+                  var payload = line.slice(5).trim();
+                  if (payload === "[DONE]") { clearTimeout(to); resolve(); return; }
+                  try {
+                    var value = JSON.parse(payload);
+                    var delta = value.choices && value.choices[0] && value.choices[0].delta && value.choices[0].delta.content;
+                    if (delta) onToken(delta);
+                  } catch (e) { /* partial line */ }
+                }
+                return pump();
+              });
+            }
+            return pump();
+          }).catch(function (e) { clearTimeout(to); tryNext(); });
+        }
+        tryNext();
+      });
+    }
+
+    // Streaming reply with offline fallback: calls onToken for each chunk,
+    // resolves when the reply is complete (full text available via onDone).
+    function getReplyStream(text, onToken, onDone) {
+      if (!state.online) {
+        var fallback = localReply(text);
+        onToken(fallback);
+        onDone(fallback);
+        return;
+      }
+      askStreamLLM(text, onToken).then(function () {
+        onDone();
+      }).catch(function () {
+        state.online = false;
+        setModelChip(false);
+        var fallback = localReply(text);
+        onToken(fallback);
+        onDone(fallback);
+      });
+    }
+
+    /* =========================================================
+       6. MAIN INTERACTION FLOW
+       ========================================================= */
+    // Incremental TTS: queue spoken chunks as tokens stream in (no restarts).
+    var streamTTS = { buf: "", last: 0, pending: 0 };
+    function decPending() {
+      streamTTS.pending -= 1;
+      if (streamTTS.pending <= 0) { streamTTS.pending = 0; setTalking(false); }
+    }
+    function speakDelta(delta) {
+      streamTTS.buf += delta;
+      var now = Date.now();
+      var words = streamTTS.buf.trim() ? streamTTS.buf.trim().split(/\s+/).length : 0;
+      if (/[.!?\n]/.test(delta) || (words >= 4 && now - streamTTS.last > 450)) {
+        var chunk = streamTTS.buf;
+        streamTTS.buf = "";
+        streamTTS.last = now;
+        if (chunk.trim()) {
+          streamTTS.pending += 1;
+          setTalking(true); // mic must stay closed while she talks
+          if ("speechSynthesis" in window) {
+            try {
+              var u = new SpeechSynthesisUtterance(chunk);
+              var v = pickVoice(); if (v) u.voice = v;
+              u.rate = 1.05; u.pitch = 1.1;
+              u.onend = u.onerror = decPending;
+              speechSynthesis.speak(u);
+              setTimeout(decPending, Math.min(6000, 400 + chunk.length * 60)); // safety
+              return;
+            } catch (e) { decPending(); }
+          }
+          setTimeout(decPending, Math.min(6000, 300 + chunk.length * 55));
+        }
+      }
+    }
+    function waitForSpeech(ms) {
+      return new Promise(function (resolve) {
+        var t0 = Date.now();
+        (function tick() {
+          if (streamTTS.pending <= 0 || Date.now() - t0 > (ms || 15000)) resolve();
+          else setTimeout(tick, 200);
+        })();
+      });
+    }
+
+    function sendMessage(text) {
+      text = (text || "").trim();
+      if (!text || state.busy) return;
+      state.busy = true;
+      chatInput.value = "";
+      setInputEnabled(false);
+      addMsg(text, "user");
+      showTyping();
+      setMood("thinking");
+      startGesture("nod", 0.8);
+      streamTTS = { buf: "", last: 0, pending: 0 };
+
+      var full = "";
+      getReplyStream(text, function (token) {
+        full += token;
+        speakDelta(token);   // start talking while the model is still writing
+      }, function () {
+        hideTyping();
+        full = full.trim();
+        addMsg(full, "bot");
+        state.lastReply = full;
+        setMood(moodFromText(full));
+        if (state.mood === "happy") startGesture("excited", 1.6);
+        else startGesture("nod", 0.8);
+        speakDelta("\n"); // flush the final buffer
+        waitForSpeech().then(function () {
+          state.busy = false; // session stays busy until she stops talking
+          // hands-free loop: listen again after the reply finishes
+          if (voiceMode) {
+            setMood("listening");
+            setStatus("Listening… talk — I answer when you pause 🎙️");
+            startRecognition();
+          }
+        });
+        flash();
+        setInputEnabled(true);
+        chatInput.focus();
+      });
+    }
+
+    function setInputEnabled(on) {
+      $("sendBtn").disabled = !on;
+      $("micBtn").disabled = !on;
+      chatInput.disabled = !on;
+    }
+
+    function flash() {
+      var f = $("flash");
+      f.classList.remove("on"); void f.offsetWidth; f.classList.add("on");
+    }
+
+    function setModelChip(ok) {
+      state.online = ok;
+      var dot = $("modelDot"), txt = $("modelText");
+      dot.className = "dot" + (ok ? " online" : "");
+      txt.textContent = ok ? ("AI: " + MODEL) : "AI offline — using built-in replies";
+    }
+
+    (function ping() {
+      var i = 0;
+      function tryNext() {
+        if (i >= MODELS_URLS.length) { setModelChip(false); return; }
+        var url = MODELS_URLS[i++];
+        fetch(url, { signal: AbortSignal.timeout(2500) })
+          .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+          .then(function () { setModelChip(true); })
+          .catch(function () { tryNext(); });
+      }
+      tryNext();
+    })();
+
+    chatForm.addEventListener("submit", function (ev) { ev.preventDefault(); sendMessage(chatInput.value); });
+    document.querySelectorAll(".chip").forEach(function (c) {
+      c.addEventListener("click", function () { sendMessage(c.dataset.q); });
+    });
+
+    /* click the avatar itself -> Ava reacts */
+    var raycaster = new THREE.Raycaster();
+    var pointer = new THREE.Vector2();
+    renderer.domElement.addEventListener("pointerdown", function (ev) {
+      if (ev.button !== 0) return;
+      var rect = renderer.domElement.getBoundingClientRect();
+      pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+      pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+      raycaster.setFromCamera(pointer, camera);
+      var hits = raycaster.intersectObjects(root.children, true);
+      if (hits.length) {
+        if (state.busy) return;
+        var lines = [
+          "Hey! That's my ticklish side! 😄",
+          "Boop! 🤖 You activated me!",
+          "Hehe, careful — I'm 100% charged! ⚡",
+          "You found my activation button — it's a secret! 🤫"
+        ];
+        var msg = lines[Math.floor(Math.random() * lines.length)];
+        addMsg(msg, "bot");
+        state.lastReply = msg;
+        setMood("happy");
+        startGesture("wave", 2.2);
+        speak(msg);
+        flash();
+      }
+    });
+
+    window.addEventListener("resize", function () {
+      camera.aspect = innerWidth / innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+    });
+    if ("speechSynthesis" in window) {
+      speechSynthesis.onvoiceschanged = function () { pickVoice(); };
+    }
+
+    /* =========================================================
+       7. RENDER LOOP
+       ========================================================= */
+    function loop() {
+      requestAnimationFrame(loop);
+      var t = clock.getElapsedTime();
+      moodFace(t);
+      poseBody(t);
+      controls.update();
+      renderer.render(scene, camera);
+    }
+
+    addMsg("Hi! I'm Ava ✨ — a 3D human avatar. Click me, type below, or hit 🎙️ Voice mode to talk hands-free.", "bot");
+    setTimeout(function () {
+      setMood("happy");
+      startGesture("wave", 2.4);
+      speak("Hi! I'm Ava, your 3D assistant. Ask me anything!");
+      flash();
+    }, 900);
+
+    loop();
+    $("loading").style.display = "none";
+  })();
+  </script>
+</body>
+</html>

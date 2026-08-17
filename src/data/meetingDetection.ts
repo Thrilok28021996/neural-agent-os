@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type DetectedMeeting = { event_id: string; title: string; starts_at: string; ends_at: string; meeting_url: string | null; workspace_id: string }
 

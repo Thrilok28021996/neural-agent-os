@@ -3,7 +3,7 @@
 **Date:** August 11, 2026 (verification pass)
 **Status:** ✅ IMPLEMENTED AND VERIFIED — see "Verification Results" below
 **Test Coverage:** 496 TypeScript tests passing (10 files) + 71 Rust unit tests (67 new)
-**Real-Code Coverage:** 98.96% statements / 86.36% branches / 100% functions / 100% lines (was 16.49% before the verification pass)
+**Real-Code Coverage:** 98.67% statements / 86.27% branches / 100% functions / 100% lines (was 16.49% before the verification pass)
 **Rust Backend:** 21 modules + 67 new unit tests
 **TypeScript Frontend:** 55 data layer files, 100% line coverage
 
@@ -429,3 +429,55 @@ missing / partial item was implemented in this pass:
 ---
 
 **Conclusion:** All 7 critical areas have been completed with full implementation, frontend integration, and comprehensive test coverage. The system is ready for the first production release.
+
+---
+
+## Sidebar Verification Pass (this session)
+
+A full per-view audit of the left-sidebar navigation was performed against the
+**real running code**, not just mocked bindings:
+
+- **Built and exercised every one of the 196 Tauri commands** that back the 17
+  sidebar views through a new self-test harness
+  (`src-tauri/examples/sidebar_selftest.rs` → `cargo run --example sidebar_selftest`,
+  also `npm run test:sidebar`). It boots a real Wry app on an isolated temp data
+  dir and drives the actual command functions: full note/memory CRUD, source
+  ingest → index → keyword/semantic/hybrid search, real Whisper transcription →
+  segments → speaker rename → segment edit → reprocess → LLM summary → action
+  promote, recording rule engine, real ffmpeg mic capture + voice capture loop,
+  calendar events/recurrence/participants/conflicts/ICS/invitations, email
+  accounts/labels/threads/LLM drafts, agents + permission grant/revoke +
+  approval approve/deny + command execution, model routes/fallback/cost/token
+  limits, provider health + real Ollama chat/embeddings/TTS/STT, diagnostics,
+  workspace export/import roundtrip/backup verify/retention/deletion, sync
+  queue, API keys, and more. **196/196 checks pass.**
+- **Found and fixed a real bug the mock-only tests could not catch:** `create_note`
+  never passed the `now` timestamp to its INSERT, so **the Notes view's "Save
+  note" always failed** ("Wrong number of parameters. Got 4, needed 5"). Fixed
+  via a testable `insert_note()` helper plus a regression test bound to the real
+  schema (`cargo test` now 94 passing).
+- **Warnings eliminated:** `cargo check` warnings reduced from 21 to **0**
+  (dead code removed from `calendar_extras`/`sync`/`health`/`email_complete`,
+  unused imports removed, tested public APIs annotated).
+- **Command-surface audit:** every one of the 188 commands the frontend invokes
+  is registered in the Rust handler (0 missing); the data-layer contract suite
+  covers 183 functions with exact command names + argument keys.
+
+Current totals: **532 TypeScript tests + 131 Rust tests + 26 live API tests +
+196 sidebar command checks — all green; `tsc -b`, `cargo check` (0 warnings),
+and the release build pass.**
+
+
+## Full plan/distribution audit correction (2026-08-14)
+
+The earlier “all acceptance criteria complete/ready for first production release”
+wording is too strong. `docs/PLAN_AUDIT.md` is the authoritative current audit.
+Core local functionality and automated checks are green, but several plan
+acceptance criteria remain partial: settings/policy enforcement, automatic
+meeting detection/recording, live transcript/audio diarization, Teams media and
+secure transfer, complete email OAuth/credentials/API sending, full agent tool
+execution, citation breadth, backup integrity, and distribution. The current
+build produces macOS arm64 app/DMG/tar artifacts locally, but updater signing,
+notarization, Windows/Linux installers, CI publishing, and clean-machine
+upgrade testing are not complete. The five remaining production gaps are
+now tracked with per-item completion criteria in `docs/RELEASE_BLOCKERS.md`.

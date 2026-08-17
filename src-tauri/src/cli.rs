@@ -14,7 +14,10 @@ fn main() {
         eprintln!("  notes <workspace>          List notes in a workspace");
         eprintln!("  transcripts <workspace> <q> Search meeting transcripts");
         eprintln!("  ask <workspace> <prompt>   Ask the assistant");
+        eprintln!("  tool <name> <workspace> <json> Call a permission-gated tool (API-key auth)");
+        eprintln!("        e.g. neural-cli tool list_tasks personal");
         eprintln!();
+        eprintln!("Write/tool commands authenticate with the NEURAL_API_KEY environment variable.");
         eprintln!("The desktop application must be running for CLI commands to work.");
         std::process::exit(1);
     }
@@ -95,6 +98,47 @@ fn main() {
                     }
                 }
                 Err(error) => eprintln!("Error: {error}"),
+            }
+        }
+        "tool" => {
+            // Permission-gated tool call through /v1/tools/call (#9): the CLI
+            // has no special powers — it is just another authenticated client.
+            let name = args.get(2).cloned().unwrap_or_default();
+            let workspace = args.get(3).cloned().unwrap_or_default();
+            let json_args = args.get(4).cloned().unwrap_or_else(|| "{}".into());
+            if name.is_empty() || workspace.is_empty() {
+                eprintln!("Usage: neural-cli tool <name> <workspace> <json-args>");
+                std::process::exit(1);
+            }
+            let api_key = std::env::var("NEURAL_API_KEY").unwrap_or_default();
+            if api_key.is_empty() {
+                eprintln!("NEURAL_API_KEY is not set. Generate one in the app (Data → API keys) and export it.");
+                std::process::exit(1);
+            }
+            let mut user_args: serde_json::Value = serde_json::from_str(&json_args).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = user_args.as_object_mut() {
+                obj.insert("workspace_id".into(), serde_json::Value::String(workspace.clone()));
+                obj.insert("agent_id".into(), serde_json::Value::String("cli".into()));
+            }
+            let body = serde_json::json!({ "tool": name, "arguments": user_args });
+            let client = reqwest::blocking::Client::new();
+            let result = client
+                .post(format!("{base}/v1/tools/call"))
+                .bearer_auth(&api_key)
+                .json(&body)
+                .send();
+            match result {
+                Ok(response) => {
+                    let status = response.status();
+                    let text = response.text().unwrap_or_default();
+                    if status.is_success() {
+                        println!("{text}");
+                    } else {
+                        eprintln!("Tool call failed (HTTP {status}): {text}");
+                        std::process::exit(1);
+                    }
+                }
+                Err(error) => { eprintln!("Error: {error}"); std::process::exit(1); }
             }
         }
         _ => eprintln!("Unknown command: {command}"),

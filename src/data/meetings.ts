@@ -1,6 +1,6 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
-export type Meeting = { id: string; title: string; recording_path?: string; status: string }
+export type Meeting = { id: string; title: string; recording_path?: string; status: string; language?: string }
 
 export function importMeetingRecording(workspaceId: string, path: string, title: string) {
   return invoke<Meeting>('import_meeting_recording', { workspaceId, path, title })

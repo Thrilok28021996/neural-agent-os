@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 import type { SearchResult } from './retrieval'
 
 export type RerankedResult = SearchResult & { relevance_score: number }

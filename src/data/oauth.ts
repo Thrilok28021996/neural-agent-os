@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type OAuthConfig = { provider: string; authorize_url: string; token_url: string; scopes: string[]; client_id: string; redirect_uri: string }
 export type PKCEParams = { code_verifier: string; code_challenge: string; state: string }

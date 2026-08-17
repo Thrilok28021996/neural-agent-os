@@ -5,7 +5,11 @@ Zero external APIs. Everything runs on your machine.
 ## Prerequisites
 
 ```bash
-# 1. Ollama (local AI — chat, embeddings, summaries)
+# 1. LM Studio (default — local AI chat, embeddings, summaries)
+
+LM Studio is the default provider: start it, load `qwen/qwen3.5-9b` (chat) and `text-embedding-nomic-embed-text-v1.5@q8_0` (embeddings), and it serves the OpenAI-compatible API at `http://127.0.0.1:1234/v1`.
+
+Ollama remains fully supported:
 brew install ollama        # macOS
 # or: curl -fsSL https://ollama.com/install.sh | sh  # Linux
 # or: https://ollama.com/download/windows             # Windows

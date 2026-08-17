@@ -89,7 +89,7 @@ describe('Settings', () => {
     expect(settings.recordingNotice).toBe(true)
     expect(settings.allowCloudAudio).toBe(false)
     expect(settings.allowCloudText).toBe(true)
-    expect(settings.dataDirectory).toBe('Choose a local folder')
+    expect(settings.dataDirectory).toBe('~/Neural Agent OS') // unified data root
   })
 
   it('saves and loads settings', async () => {

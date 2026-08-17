@@ -336,11 +336,11 @@ Go to **Models** view to configure which model handles each capability:
 
 | Capability | Default | Description |
 |---|---|---|
-| Chat | Ollama / qwen3:14b | Conversation and reasoning |
+| Chat | LM Studio / qwen/qwen3.5-9b | Conversation and reasoning |
 | Transcription | Local / whisper-large-v3 | Audio-to-text |
-| Embeddings | Ollama / nomic-embed-text | Semantic search vectors |
+| Embeddings | LM Studio / text-embedding-nomic-embed-text-v1.5@q8_0 | Semantic search |
 | Speech | OpenAI / tts-1 | Text-to-speech |
-| Summarization | Ollama / qwen3:14b | Meeting and document summaries |
+| Summarization | LM Studio / qwen/qwen3.5-9b | Meeting and document summaries |
 
 ### Provider Fallback
 1. In Models, configure fallback chains per capability

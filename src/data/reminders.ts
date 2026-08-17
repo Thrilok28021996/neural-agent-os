@@ -1,7 +1,7 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
 
-export type Reminder = { id: string; workspace_id: string; task_id?: string; title: string; scheduled_at: string; status: string }
+export type Reminder = { id: string; workspace_id: string; task_id?: string; calendar_event_id?: string; title: string; scheduled_at: string; status: string }
 
 export function scheduleTaskReminder(workspaceId: string, taskId: string, title: string, scheduledAt: string) {
   return invoke<Reminder>('schedule_task_reminder', { workspaceId, taskId, title, scheduledAt })

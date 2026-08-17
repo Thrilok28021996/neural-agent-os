@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type CalendarEvent = { id: string; workspace_id: string; title: string; starts_at: string; ends_at: string; meeting_url?: string; provider: string; recurrence?: string }
 export function listCalendarEvents(workspaceId: string) { return invoke<CalendarEvent[]>('list_calendar_events', { workspaceId }) }

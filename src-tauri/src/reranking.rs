@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection};
+use rusqlite::Connection;
 use serde::Serialize;
 
 #[derive(Serialize)]
@@ -16,16 +16,18 @@ pub struct RerankedResult {
 /// keyword-density based scoring.
 pub fn rerank_results(
     connection: &Connection,
+    workspace_id: &str,
     query: &str,
     results: &[super::SearchResult],
-    use_ollama: bool,
+    use_provider: bool,
 ) -> Result<Vec<RerankedResult>, String> {
+    log::info!("reranking::rerank_results: enter");
     if results.is_empty() {
         return Ok(Vec::new());
     }
 
-    if use_ollama {
-        rerank_with_ollama(connection, query, results)
+    if use_provider {
+        rerank_with_provider(connection, workspace_id, query, results)
     } else {
         Ok(rerank_local(query, results))
     }
@@ -76,14 +78,12 @@ fn rerank_local(query: &str, results: &[super::SearchResult]) -> Vec<RerankedRes
     ranked
 }
 
-fn rerank_with_ollama(
-    _connection: &Connection,
+fn rerank_with_provider(
+    connection: &Connection,
+    workspace_id: &str,
     query: &str,
     results: &[super::SearchResult],
 ) -> Result<Vec<RerankedResult>, String> {
-    let endpoint = std::env::var("NEURAL_OLLAMA_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/generate".into());
-
     let mut ranked = Vec::new();
 
     for result in results.iter().take(30) {
@@ -95,18 +95,18 @@ fn rerank_with_ollama(
             result.content.chars().take(800).collect::<String>()
         );
 
-        let score: f32 = reqwest::blocking::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({
-                "model": "qwen3:14b",
-                "prompt": prompt,
-                "stream": false
-            }))
-            .send()
-            .ok()
-            .and_then(|r| r.json::<serde_json::Value>().ok())
-            .and_then(|v| v["response"].as_str().unwrap_or("5").parse().ok())
-            .unwrap_or(5.0);
+        // Score via the workspace's routed chat provider (LM Studio by
+        // default); any non-numeric answer falls back to a neutral 5.
+        let score: f32 = crate::chat::chat_completion(
+            connection,
+            workspace_id,
+            "chat",
+            &crate::default_lmstudio_model(),
+            &prompt,
+        )
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(5.0);
 
         ranked.push(RerankedResult {
             source_id: result.source_id.clone(),

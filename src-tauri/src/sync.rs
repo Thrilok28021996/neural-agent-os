@@ -47,6 +47,7 @@ pub fn enqueue_sync(
     action: &str,
     payload: &serde_json::Value,
 ) -> Result<SyncQueueItem, String> {
+    log::info!("sync::enqueue_sync: enter");
     let id = format!("sync-{}", uuid::Uuid::new_v4());
 
     connection.execute(
@@ -79,6 +80,7 @@ pub fn get_pending_syncs(
     provider: &str,
     limit: usize,
 ) -> Result<Vec<SyncQueueItem>, String> {
+    log::debug!("sync::get_pending_syncs: enter");
     let mut stmt = connection.prepare(
         "SELECT id, entity_type, entity_id, provider, action, payload_json, status, retry_count,
          error, conflict_details, created_at, synced_at
@@ -102,6 +104,7 @@ pub fn get_pending_syncs(
 
 /// Mark a sync item as synced
 pub fn mark_synced(connection: &Connection, queue_id: &str) -> Result<(), String> {
+    log::info!("sync::mark_synced: enter");
     connection.execute(
         "UPDATE sync_queue SET status = 'synced', synced_at = ?1 WHERE id = ?2",
         params![Utc::now().to_rfc3339(), queue_id],
@@ -115,6 +118,7 @@ pub fn mark_sync_failed(
     queue_id: &str,
     error: &str,
 ) -> Result<(), String> {
+    log::info!("sync::mark_sync_failed: enter");
     connection.execute(
         "UPDATE sync_queue SET status = 'failed', error = ?1, retry_count = retry_count + 1 WHERE id = ?2",
         params![error, queue_id],
@@ -128,6 +132,7 @@ pub fn mark_sync_conflict(
     queue_id: &str,
     details: &str,
 ) -> Result<(), String> {
+    log::info!("sync::mark_sync_conflict: enter");
     connection.execute(
         "UPDATE sync_queue SET status = 'conflict', conflict_details = ?1 WHERE id = ?2",
         params![details, queue_id],
@@ -141,6 +146,7 @@ pub fn resolve_conflict(
     queue_id: &str,
     resolution: &str, // keep_local or keep_remote
 ) -> Result<ConflictResolution, String> {
+    log::info!("sync::resolve_conflict: enter");
     if !["keep_local", "keep_remote", "merge"].contains(&resolution) {
         return Err("Resolution must be keep_local, keep_remote, or merge".into());
     }
@@ -201,6 +207,7 @@ pub fn get_sync_status(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<SyncStatus>, String> {
+    log::debug!("sync::get_sync_status: enter");
     let mut stmt = connection.prepare(
         "SELECT provider FROM calendar_connections WHERE workspace_id = ?1
          UNION SELECT provider FROM email_accounts WHERE workspace_id = ?1"
@@ -242,6 +249,7 @@ pub fn get_sync_status(
 
 /// Process pending sync queue - called by scheduler
 pub fn process_sync_queue(app: &tauri::AppHandle) -> Result<usize, String> {
+    log::info!("sync::process_sync_queue: enter");
     let connection = super::open_database(app)?;
     let items = get_pending_syncs(&connection, "", 10)?;
     let mut processed = 0;
@@ -281,6 +289,7 @@ pub fn pull_remote_calendar_events(
     app: &tauri::AppHandle,
     connection_id: &str,
 ) -> Result<(usize, usize, usize), String> {
+    log::info!("sync::pull_remote_calendar_events: enter");
     let connection = super::open_database(app)?;
     let (workspace_id, provider): (String, String) = connection.query_row(
         "SELECT workspace_id, provider FROM calendar_connections WHERE id = ?1",
@@ -435,7 +444,7 @@ pub fn pull_remote_calendar_events(
 }
 
 /// Get OAuth access token from keychain, refreshing if needed
-fn get_oauth_token(app: &tauri::AppHandle, provider: &str, scope: &str) -> Result<String, String> {
+fn get_oauth_token(_app: &tauri::AppHandle, provider: &str, scope: &str) -> Result<String, String> {
     let token_entry = keyring::Entry::new(
         "neural-agent-os/oauth",
         &format!("{provider}:{scope}:access_token"),
@@ -458,7 +467,7 @@ fn get_oauth_token(app: &tauri::AppHandle, provider: &str, scope: &str) -> Resul
                     "neural-agent-os/oauth",
                     &format!("{provider}:{scope}:refresh_token"),
                 ).map_err(|e| e.to_string())?;
-                let refresh_token = refresh_entry.get_password().map_err(|e| e.to_string())?;
+                let _ = refresh_entry.get_password().map_err(|e| e.to_string())?;
                 return super::oauth::refresh_access_token(provider);
             }
         }

@@ -10,7 +10,9 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "test:api": "bash scripts/live-api-test.sh",
+    "test:sidebar": "cd src-tauri && cargo run --example sidebar_selftest"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.5.0",

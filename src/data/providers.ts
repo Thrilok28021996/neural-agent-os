@@ -1,10 +1,20 @@
+import { invoke } from './invoke'
 export type ModelCapability = 'chat' | 'transcription' | 'embeddings' | 'speech'
 export type ProviderStatus = { model: string; local: boolean; provider: string; healthy: boolean }
 
+// LM Studio is the default provider. The model ids are the ones loaded in
+// LM Studio on this machine; override with NEURAL_OPENAI_COMPATIBLE_MODEL /
+// NEURAL_OPENAI_COMPATIBLE_EMBEDDING_MODEL.
+export const DEFAULT_LMSTUDIO_MODEL = 'qwen/qwen3.5-9b'
+// Voice uses a smaller no-think model for low first-token latency. Keep the
+// main chat model unchanged; override this with NEURAL_VOICE_MODEL if needed.
+export const VOICE_LMSTUDIO_MODEL = 'aisha/qwen3.5-4b-nothink'
+export const DEFAULT_LMSTUDIO_EMBEDDING_MODEL = 'text-embedding-nomic-embed-text-v1.5@q8_0'
+
 export const providerStore: Record<ModelCapability, ProviderStatus> = {
-  chat: { model: 'qwen3:14b', provider: 'Ollama', local: true, healthy: true },
-  transcription: { model: 'whisper-large-v3', provider: 'Local runtime', local: true, healthy: true },
-  embeddings: { model: 'nomic-embed-text', provider: 'Ollama', local: true, healthy: true },
+  chat: { model: DEFAULT_LMSTUDIO_MODEL, provider: 'LM Studio', local: true, healthy: true },
+  transcription: { model: 'mlx-community/whisper-large-v3-turbo', provider: 'Local runtime', local: true, healthy: true },
+  embeddings: { model: DEFAULT_LMSTUDIO_EMBEDDING_MODEL, provider: 'LM Studio', local: true, healthy: true },
   speech: { model: 'OpenAI TTS', provider: 'OpenAI', local: false, healthy: true },
 }
 
@@ -48,4 +58,11 @@ export function providerLabel(providerId: string): string {
   if (option) return option.label
   const byLabel = providerOptions.find((p) => p.label.toLowerCase() === providerId.toLowerCase())
   return byLabel?.label ?? providerId
+}
+
+export type ProviderConnectionResult = { provider: string; ok: boolean; http_status?: number }
+
+/** Verify a provider endpoint with the stored/env API key (P2). */
+export function testProviderConnection(providerId: string) {
+  return invoke<ProviderConnectionResult>('test_provider_connection', { provider: providerId })
 }

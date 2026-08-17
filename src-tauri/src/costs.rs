@@ -66,6 +66,7 @@ pub fn record_token_usage(
     input_tokens: i64,
     output_tokens: i64,
 ) -> Result<(), String> {
+    log::info!("costs::record_token_usage: enter");
     let (input_price, output_price) = provider_pricing(provider, model);
     let cost_cents =
         (input_tokens as f64 / 1_000_000.0 * input_price
@@ -97,6 +98,7 @@ pub fn get_cost_summary(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<CostSummary, String> {
+    log::debug!("costs::get_cost_summary: enter");
     let total_tokens: i64 = connection
         .query_row(
             "SELECT COALESCE(SUM(input_tokens + output_tokens), 0)
@@ -192,6 +194,7 @@ pub fn check_cost_limit(
     workspace_id: &str,
     limit_cents: i64,
 ) -> Result<bool, String> {
+    log::debug!("costs::check_cost_limit: enter");
     let total: i64 = connection
         .query_row(
             "SELECT COALESCE(SUM(cost_cents), 0) FROM token_usage WHERE workspace_id = ?1",
@@ -209,6 +212,7 @@ pub fn set_cost_limit(
     capability: &str,
     limit_cents: i64,
 ) -> Result<(), String> {
+    log::info!("costs::set_cost_limit: enter");
     connection
         .execute(
             "INSERT INTO cost_limits (workspace_id, capability, limit_cents)
@@ -226,6 +230,7 @@ pub fn get_cost_limit(
     workspace_id: &str,
     capability: &str,
 ) -> Result<Option<i64>, String> {
+    log::debug!("costs::get_cost_limit: enter");
     connection
         .query_row(
             "SELECT limit_cents FROM cost_limits WHERE workspace_id = ?1 AND capability = ?2",

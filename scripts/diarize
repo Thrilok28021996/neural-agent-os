@@ -1,0 +1,7 @@
+#!/bin/sh
+# Wrapper so the Rust app can resolve the audio diarizer as one executable
+# (NEURAL_DIARIZE_BIN or PATH). Runs scripts/diarize.py with the pyannote venv.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+export MPLBACKEND=agg   # headless matplotlib (override any inherited inline backend)
+# speechbrain asks "proceed with download? (Y/n)" on first model fetch; answer y
+printf 'y\n' | "$DIR/.venv/bin/python" "$DIR/diarize.py" "$@"

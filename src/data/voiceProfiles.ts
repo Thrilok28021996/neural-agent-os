@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type VoiceProfile = { id: string; workspace_id: string; speaker_label: string; sample_count: number }
 

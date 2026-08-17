@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use std::io::Read;
+
 
 #[derive(Serialize)]
 pub struct EmailThread {
@@ -37,9 +37,10 @@ pub fn rebuild_threads(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<EmailThread>, String> {
+    log::info!("email_complete::rebuild_threads: enter");
     // Get all emails in workspace, ordered by subject and date
     let mut stmt = connection.prepare(
-        "SELECT e.id, e.subject, e.sender, COALESCE(e.body, ''), e.received_at, e.provider_id
+        "SELECT e.id, e.subject, e.sender, COALESCE(e.body, ''), e.received_at
          FROM emails e
          JOIN email_accounts ea ON ea.id = e.account_id
          WHERE ea.workspace_id = ?1
@@ -49,13 +50,13 @@ pub fn rebuild_threads(
     #[derive(Clone)]
     struct RawEmail {
         id: String, subject: String, sender: Option<String>,
-        body: String, received_at: Option<String>, provider_id: Option<String>,
+        body: String, received_at: Option<String>,
     }
 
     let emails: Vec<RawEmail> = stmt.query_map(params![workspace_id], |row| {
         Ok(RawEmail {
             id: row.get(0)?, subject: row.get(1)?, sender: row.get(2)?,
-            body: row.get(3)?, received_at: row.get(4)?, provider_id: row.get(5)?,
+            body: row.get(3)?, received_at: row.get(4)?,
         })
     }).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
 
@@ -113,6 +114,7 @@ pub fn rebuild_threads(
 }
 
 pub(crate) fn clean_subject(subject: &str) -> String {
+    log::info!("email_complete::clean_subject: enter");
     let mut s = subject.to_lowercase().trim().to_string();
     // Remove common prefixes
     for prefix in &["re:", "fwd:", "fw:", "aw:", "wg:", "sv:"] {
@@ -138,6 +140,7 @@ pub fn create_label(
     name: &str,
     color: Option<&str>,
 ) -> Result<EmailLabel, String> {
+    log::info!("email_complete::create_label: enter");
     let id = format!("label-{}", uuid::Uuid::new_v4());
     connection.execute(
         "INSERT INTO email_labels (id, account_id, name, color) VALUES (?1, ?2, ?3, ?4)",
@@ -148,6 +151,7 @@ pub fn create_label(
 
 /// List labels for an account
 pub fn list_labels(connection: &Connection, account_id: &str) -> Result<Vec<EmailLabel>, String> {
+    log::debug!("email_complete::list_labels: enter");
     let mut stmt = connection.prepare(
         "SELECT id, account_id, name, provider_label_id, color FROM email_labels WHERE account_id = ?1"
     ).map_err(|e| e.to_string())?;
@@ -160,6 +164,7 @@ pub fn list_labels(connection: &Connection, account_id: &str) -> Result<Vec<Emai
 
 /// Assign a label to an email
 pub fn label_email(connection: &Connection, email_id: &str, label_id: &str) -> Result<(), String> {
+    log::info!("email_complete::label_email: enter");
     connection.execute(
         "INSERT OR IGNORE INTO email_label_assignments (email_id, label_id) VALUES (?1, ?2)",
         params![email_id, label_id],
@@ -169,6 +174,7 @@ pub fn label_email(connection: &Connection, email_id: &str, label_id: &str) -> R
 
 /// Get emails by label
 pub fn get_labeled_emails(connection: &Connection, label_id: &str) -> Result<Vec<String>, String> {
+    log::debug!("email_complete::get_labeled_emails: enter");
     let mut stmt = connection.prepare(
         "SELECT email_id FROM email_label_assignments WHERE label_id = ?1"
     ).map_err(|e| e.to_string())?;
@@ -185,6 +191,7 @@ pub fn index_attachment(
     content_type: &str,
     size_bytes: i64,
 ) -> Result<(), String> {
+    log::info!("email_complete::index_attachment: enter");
     let id = format!("att-{}", uuid::Uuid::new_v4());
     connection.execute(
         "INSERT INTO email_attachments (id, email_id, filename, content_type, size_bytes) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -200,6 +207,7 @@ pub fn extract_attachment_text(
     path: &str,
     filename: &str,
 ) -> Result<String, String> {
+    log::info!("email_complete::extract_attachment_text: enter");
     let extension = std::path::Path::new(filename)
         .extension()
         .and_then(|e| e.to_str())
@@ -244,6 +252,7 @@ pub fn suggest_workspace_for_email(
     connection: &Connection,
     email_id: &str,
 ) -> Result<String, String> {
+    log::info!("email_complete::suggest_workspace_for_email: enter");
     let (subject, body, sender): (String, Option<String>, Option<String>) = connection.query_row(
         "SELECT subject, body, sender FROM emails WHERE id = ?1",
         params![email_id],
@@ -294,6 +303,7 @@ pub fn generate_email_draft(
     context: &str,
     model: &str,
 ) -> Result<String, String> {
+    log::info!("email_complete::generate_email_draft: enter");
     let prompt = format!(
         "You are an email drafting assistant. Write a professional email based on the instructions and context provided.\\n\\
         Return only the email body text, no explanations.\\n\\
@@ -311,6 +321,7 @@ pub fn summarize_email_thread(
     workspace_id: &str,
     model: &str,
 ) -> Result<String, String> {
+    log::info!("email_complete::summarize_email_thread: enter");
     // Get all messages in the thread
     let mut stmt = connection.prepare(
         "SELECT e.subject, e.sender, COALESCE(e.body, ''), e.received_at
@@ -360,6 +371,7 @@ pub fn extract_email_actions(
     workspace_id: &str,
     model: &str,
 ) -> Result<Vec<String>, String> {
+    log::info!("email_complete::extract_email_actions: enter");
     let (subject, body): (String, Option<String>) = connection.query_row(
         "SELECT subject, body FROM emails WHERE id = ?1",
         params![email_id],
@@ -449,7 +461,7 @@ mod tests {
 
     #[test]
     fn extract_attachment_text_supports_txt() {
-        let conn = setup();
+        let _conn = setup();
         let dir = std::env::temp_dir().join(format!("nao-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("notes.txt");

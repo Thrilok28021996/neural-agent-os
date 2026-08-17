@@ -19,6 +19,8 @@ VOLUME ["/data"]
 
 ENV NEURAL_TEAMS_DATA_DIR=/data
 ENV NEURAL_API_URL=http://host.docker.internal:8787
+# REQUIRED: shared secret (must match NAO_TEAMS_BOT_SECRET on the local app)
+# ENV NAO_TEAMS_BOT_SECRET=change-me
 
 EXPOSE 8445
 

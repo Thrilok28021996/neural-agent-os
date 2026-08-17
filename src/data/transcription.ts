@@ -1,9 +1,9 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type TranscriptionJob = { id: string; meeting_id: string; provider: string; status: string; error?: string }
 
-export function queueTranscription(meetingId: string, provider = 'local-whisper') {
-  return invoke<TranscriptionJob>('queue_transcription', { meetingId, provider })
+export function queueTranscription(meetingId: string, provider = 'local-whisper', language?: string) {
+  return invoke<TranscriptionJob>('queue_transcription', { meetingId, provider, language })
 }
 
 export function listTranscriptionJobs(meetingId: string) {
@@ -15,6 +15,6 @@ export function processTranscriptionJob(jobId: string) {
 }
 
 /** Re-queue transcription for an existing meeting (plan §7: reprocessing). */
-export function reprocessTranscription(meetingId: string, provider = 'local-whisper') {
-  return invoke<TranscriptionJob>('reprocess_transcription', { meetingId, provider })
+export function reprocessTranscription(meetingId: string, provider = 'local-whisper', language?: string) {
+  return invoke<TranscriptionJob>('reprocess_transcription', { meetingId, provider, language })
 }

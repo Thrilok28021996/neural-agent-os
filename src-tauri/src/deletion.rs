@@ -39,6 +39,7 @@ pub fn preview_source_deletion(
     connection: &Connection,
     source_id: &str,
 ) -> Result<SourceDeletionPreview, String> {
+    log::debug!("deletion::preview_source_deletion: enter");
     let (title, kind): (String, String) = connection
         .query_row(
             "SELECT title, kind FROM sources WHERE id = ?1",
@@ -87,6 +88,7 @@ pub fn preview_meeting_deletion(
     connection: &Connection,
     meeting_id: &str,
 ) -> Result<MeetingDeletionPreview, String> {
+    log::debug!("deletion::preview_meeting_deletion: enter");
     let (title, recording_path): (String, Option<String>) = connection
         .query_row(
             "SELECT title, recording_path FROM meetings WHERE id = ?1",
@@ -141,6 +143,7 @@ pub fn full_deletion_preview(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<FullDeletionPreview, String> {
+    log::info!("deletion::full_deletion_preview: enter");
     let workspace_name: String = connection
         .query_row(
             "SELECT name FROM workspaces WHERE id = ?1",

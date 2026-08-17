@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type PermissionCheck = { capability: string; allowed: boolean; reason: string }
 export type AgentPermission = { agent_id?: string; capability: string; granted: boolean; workspace_id: string }

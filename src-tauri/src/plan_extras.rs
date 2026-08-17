@@ -64,6 +64,7 @@ pub fn set_token_limit(
     capability: &str,
     limit_tokens: i64,
 ) -> Result<(), String> {
+    log::info!("plan_extras::set_token_limit: enter");
     connection
         .execute(
             "INSERT INTO token_limits (workspace_id, capability, limit_tokens) VALUES (?1, ?2, ?3)
@@ -75,6 +76,7 @@ pub fn set_token_limit(
 }
 
 pub fn get_token_limit(connection: &Connection, workspace_id: &str, capability: &str) -> Result<Option<i64>, String> {
+    log::debug!("plan_extras::get_token_limit: enter");
     connection
         .query_row(
             "SELECT limit_tokens FROM token_limits WHERE workspace_id = ?1 AND capability = ?2",
@@ -89,6 +91,7 @@ pub fn get_token_limit(connection: &Connection, workspace_id: &str, capability: 
 }
 
 pub fn list_token_limits(connection: &Connection, workspace_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    log::debug!("plan_extras::list_token_limits: enter");
     let mut stmt = connection
         .prepare("SELECT capability, limit_tokens FROM token_limits WHERE workspace_id = ?1")
         .map_err(|e| e.to_string())?;
@@ -120,6 +123,7 @@ pub fn create_memory(
     source_kind: Option<&str>,
     source_id: Option<&str>,
 ) -> Result<MemoryRecord, String> {
+    log::info!("plan_extras::create_memory: enter");
     if content.trim().is_empty() {
         return Err("Memory content cannot be empty".into());
     }
@@ -132,6 +136,7 @@ pub fn create_memory(
 }
 
 pub fn list_memories(connection: &Connection, workspace_id: &str) -> Result<Vec<MemoryRecord>, String> {
+    log::debug!("plan_extras::list_memories: enter");
     let mut stmt = connection.prepare(
         "SELECT id, workspace_id, content, source_kind, source_id, created_at, updated_at FROM memories WHERE workspace_id = ?1 ORDER BY created_at DESC",
     ).map_err(|e| e.to_string())?;
@@ -143,6 +148,7 @@ pub fn list_memories(connection: &Connection, workspace_id: &str) -> Result<Vec<
 }
 
 pub fn search_memories(connection: &Connection, workspace_id: &str, query: &str) -> Result<Vec<MemoryRecord>, String> {
+    log::debug!("plan_extras::search_memories: enter");
     let pattern = format!("%{}%", query);
     let mut stmt = connection.prepare(
         "SELECT id, workspace_id, content, source_kind, source_id, created_at, updated_at FROM memories WHERE workspace_id = ?1 AND content LIKE ?2 ORDER BY created_at DESC",
@@ -155,6 +161,7 @@ pub fn search_memories(connection: &Connection, workspace_id: &str, query: &str)
 }
 
 pub fn delete_memory(connection: &Connection, memory_id: &str) -> Result<(), String> {
+    log::info!("plan_extras::delete_memory: enter");
     let changed = connection
         .execute("DELETE FROM memories WHERE id = ?1", params![memory_id])
         .map_err(|e| e.to_string())?;
@@ -166,6 +173,7 @@ pub fn delete_memory(connection: &Connection, memory_id: &str) -> Result<(), Str
 
 // ── Duplicate detection ─────────────────────────────────────────────────────
 pub fn find_duplicates(connection: &Connection, workspace_id: &str) -> Result<Vec<DuplicateGroup>, String> {
+    log::info!("plan_extras::find_duplicates: enter");
     let mut stmt = connection.prepare(
         "SELECT content_hash FROM sources WHERE workspace_id = ?1 AND content_hash IS NOT NULL GROUP BY content_hash HAVING COUNT(*) > 1",
     ).map_err(|e| e.to_string())?;
@@ -196,7 +204,8 @@ pub fn find_duplicates(connection: &Connection, workspace_id: &str) -> Result<Ve
 
 // ── Email keyword search ────────────────────────────────────────────────────
 pub fn search_emails(connection: &Connection, workspace_id: &str, query: &str) -> Result<Vec<EmailHit>, String> {
-    let match_query = query.split_whitespace().collect::<Vec<_>>().join(" OR ");
+    log::debug!("plan_extras::search_emails: enter");
+    let match_query = crate::fts5_match_terms(query);
     let mut stmt = connection.prepare(
         "SELECT e.id, e.account_id, e.subject, e.sender, e.recipients, e.body, e.received_at
          FROM emails e JOIN email_accounts ea ON ea.id = e.account_id
@@ -214,6 +223,7 @@ pub fn search_emails(connection: &Connection, workspace_id: &str, query: &str) -
 
 // ── Transcript editing ──────────────────────────────────────────────────────
 pub fn update_transcript_segment_text(connection: &Connection, segment_id: &str, text: &str) -> Result<(), String> {
+    log::info!("plan_extras::update_transcript_segment_text: enter");
     if text.trim().is_empty() {
         return Err("Segment text cannot be empty".into());
     }
@@ -228,6 +238,7 @@ pub fn update_transcript_segment_text(connection: &Connection, segment_id: &str,
 
 // ── Email triage ────────────────────────────────────────────────────────────
 pub fn email_triage(connection: &Connection, workspace_id: &str) -> Result<Vec<TriageItem>, String> {
+    log::info!("plan_extras::email_triage: enter");
     let mut stmt = connection.prepare(
         "SELECT e.id, e.subject, e.sender, e.received_at FROM emails e
          JOIN email_accounts ea ON ea.id = e.account_id
@@ -260,6 +271,7 @@ pub fn schedule_event_reminder(
     title: &str,
     scheduled_at: &str,
 ) -> Result<crate::ReminderRecord, String> {
+    log::info!("plan_extras::schedule_event_reminder: enter");
     if chrono::DateTime::parse_from_rfc3339(scheduled_at).is_err() {
         return Err("scheduled_at must be an RFC3339 timestamp".into());
     }
@@ -294,6 +306,7 @@ pub fn record_bot_run(
     message: Option<&str>,
     meeting_id: Option<&str>,
 ) -> Result<(), String> {
+    log::info!("plan_extras::record_bot_run: enter");
     connection.execute(
         "INSERT INTO bot_runs (id, workspace_id, bot_id, status, message, meeting_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![format!("bot-run-{}", uuid::Uuid::new_v4()), workspace_id, bot_id, status, message, meeting_id],
@@ -302,6 +315,7 @@ pub fn record_bot_run(
 }
 
 pub fn list_bot_runs(connection: &Connection, workspace_id: &str) -> Result<Vec<BotRunRecord>, String> {
+    log::debug!("plan_extras::list_bot_runs: enter");
     let mut stmt = connection.prepare(
         "SELECT id, workspace_id, bot_id, status, message, meeting_id, platform, reported_at FROM bot_runs WHERE workspace_id = ?1 ORDER BY reported_at DESC LIMIT 50",
     ).map_err(|e| e.to_string())?;
@@ -314,6 +328,7 @@ pub fn list_bot_runs(connection: &Connection, workspace_id: &str) -> Result<Vec<
 
 // ── Context export ──────────────────────────────────────────────────────────
 pub fn export_context(connection: &Connection, workspace_id: &str) -> Result<String, String> {
+    log::info!("plan_extras::export_context: enter");
     let ws_name: String = connection.query_row("SELECT name FROM workspaces WHERE id = ?1", params![workspace_id], |row| row.get(0)).unwrap_or_else(|_| workspace_id.to_string());
     let mut out = format!("# Workspace Context: {ws_name}\n\n");
     out.push_str("## Sources\n");

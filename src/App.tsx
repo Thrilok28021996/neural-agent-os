@@ -1,6 +1,6 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { loadSelectedWorkspace, saveSelectedWorkspace, workspaceStore, type Workspace } from './data/workspaces'
-import { checkProvider, providerStore, type ModelCapability } from './data/providers'
+import { checkProvider, providerStore, DEFAULT_LMSTUDIO_MODEL, VOICE_LMSTUDIO_MODEL, DEFAULT_LMSTUDIO_EMBEDDING_MODEL, type ModelCapability } from './data/providers'
 import { loadSettings, saveSettings, type LocalSettings } from './data/settings'
 import { loadNativeSetting, loadNativeWorkspaces, saveNativeSetting, setDataDirectory } from './data/native'
 import { createWorkspace, deleteWorkspace, previewWorkspaceDeletion, type WorkspaceDeletionPreview } from './data/workspacesAdmin'
@@ -11,15 +11,15 @@ import { embedSources } from './data/embeddings'
 import { semanticSearchSources } from './data/semanticSearch'
 import { listOpenActions, type OpenAction } from './data/actions'
 import { deleteSource, listSources, type Source } from './data/sources'
-import { askAssistant } from './data/assistant'
+import { askAssistant, streamVoiceReply } from './data/assistant'
 import { createAgent, listAgentRuns, listAgents, runAgentNow, updateAgent, updateAgentStatus, type Agent, type AgentRun } from './data/agents'
 import { startLocalRecording, stopLocalRecording, checkRecordingAllowed, type RecordingDecision } from './data/recording'
-import { exportWorkspace, importWorkspace } from './data/export'
-import { listModelRoutes, setModelRoute, type ModelRoute } from './data/modelRoutes'
+import { exportWorkspace, importWorkspace, verifyBackup } from './data/export'
+import { listModelRoutes, setModelRoute, downloadModel, type ModelRoute } from './data/modelRoutes'
 import { importMeetingRecording, listMeetings, type Meeting } from './data/meetings'
 import { processTranscriptionJob, queueTranscription } from './data/transcription'
 import { listTranscriptSegments, updateTranscriptSpeaker, type TranscriptSegment } from './data/transcripts'
-import { summarizeMeeting, type MeetingSummary } from './data/summaries'
+import { summarizeMeeting, getMeetingSummary, type MeetingSummary } from './data/summaries'
 import { createTask, deleteTask, listTasks, promoteAction, updateTaskStatus, type Task } from './data/tasks'
 import { cancelReminder, deleteReminder, listReminders, notifyReminder, scheduleTaskReminder, type Reminder } from './data/reminders'
 import { createCalendarEvent, deleteCalendarEvent, listCalendarEvents, updateCalendarEvent, pullRemoteCalendar, type CalendarEvent } from './data/calendar'
@@ -36,17 +36,21 @@ import { importMeetingRecordingsBatch } from './data/meetings'
 import { reprocessTranscription } from './data/transcription'
 import { updateTranscriptSegmentText } from './data/transcripts'
 import { createMemory, deleteMemory, listMemories, type Memory } from './data/memories'
-import { startVoiceCapture, stopVoiceCapture } from './data/voiceCapture'
+import { getQueueStatus, listJobs, cancelJob, type BackgroundJob, type JobQueueStatus } from './data/jobQueue'
+import { startVoiceCapture, stopVoiceCapture, checkVoiceSilence } from './data/voiceCapture'
+import { localTextToSpeech } from './data/voicePipeline'
 import { getTokenLimit, setTokenLimit } from './data/tokenLimits'
-import { providerOptions } from './data/providers'
+import { semanticSearchEmails } from './data/emailSearch'
+import { providerOptions, testProviderConnection } from './data/providers'
 import { deleteProviderSecret, storeProviderSecret } from './data/providerSecrets'
 import { scheduleEventReminder } from './data/calendar'
 import type { BotRun } from './data/botRuns'
 import { ask, message } from '@tauri-apps/plugin-dialog'
+import { sendNotification } from '@tauri-apps/plugin-notification'
 import { pickDirectory } from './data/native'
 import { conversationSearch } from './data/conversationSearch'
 import { sendEmail } from './data/emailSend'
-import { languageSpeechCodes, type AssistantLanguage } from './data/language'
+import { languageLabels, languageSpeechCodes, type AssistantLanguage } from './data/language'
 import { detectUpcomingMeetings, type DetectedMeeting } from './data/meetingDetection'
 import { generateOAuthUrl, syncCalendarEvents } from './data/calendarSync'
 import { extractEmailActions, linkTranscriptToProfile } from './data/automation'
@@ -57,18 +61,30 @@ import { getCostSummary, setCostLimit, type CostSummary } from './data/costTrack
 import { getFallbackChain, setFallbackProvider, type FallbackChain } from './data/fallback'
 import { addMonitoredFolder, listMonitoredFolders, removeMonitoredFolder, type MonitoredFolder } from './data/monitoring'
 import { rerankSearch } from './data/reranking'
-import { ThreeDAssistant } from './components/ThreeDAssistant'
-import { getStorageStats, getAuditLog, type StorageStats } from './data/diagnostics'
+import { HumanAvatar } from './components/HumanAvatar'
+import { getStorageStats, getAuditLog, cleanupOldRecordings, type StorageStats, type AuditEntry } from './data/diagnostics'
 import { getProviderHealth, refreshProviderHealth, type ProviderHealth } from './data/health'
 import { listPendingApprovals, approveRequest, denyRequest, type ApprovalRequest } from './data/approvals'
 import { rebuildThreads, createLabel, listLabels, labelEmail, generateEmailDraft, summarizeEmailThread, type EmailThread, type EmailLabel } from './data/emailComplete'
-import { expandRecurringEvent, evaluateRecordingRules, setRecordingRule, commonTimezones } from './data/calendarComplete'
+import { expandRecurringEvent, evaluateRecordingRules, setRecordingRule, listRecordingRules, deleteRecordingRule, type RecordingRule } from './data/calendarComplete'
 import { launchMeetingBot } from './data/meetingBot'
+import { logEvent, readAppLog, appLogPath } from './data/logging'
 import { fullDeletionPreview, previewSourceDeletion, previewMeetingDeletion, type FullDeletionPreview, type SourceDeletionPreview, type MeetingDeletionPreview } from './data/deletion'
 import { getSyncStatus, resolveSyncConflict, type SyncStatus } from './data/syncQueue'
 import { generateApiKey, listApiKeys, revokeApiKey, deleteTranscriptSegments, deleteMeetingSummary, deleteMeetingActions, deleteMeetingRecording, setWorkspaceRetention } from './data/security'
 
-type View = 'overview' | 'meetings' | 'capture' | 'notes' | 'knowledge' | 'sources' | 'calendar' | 'mail' | 'agents' | 'models' | 'data' | 'settings' | 'three-d' | 'limits' | 'diagnostics' | 'approvals' | 'threads'
+interface BrowserRecognition {
+  lang: string
+  interimResults: boolean
+  continuous: boolean
+  onresult: ((ev: { resultIndex: number; results: ArrayLike<ArrayLike<{ transcript: string }>> }) => void) | null
+  onend: (() => void) | null
+  onerror: ((ev: { error: string }) => void) | null
+  start: () => void
+  stop: () => void
+}
+
+type View = 'overview' | 'meetings' | 'capture' | 'notes' | 'knowledge' | 'sources' | 'tasks' | 'actions' | 'calendar' | 'mail' | 'agents' | 'models' | 'data' | 'settings' | 'three-d' | 'limits' | 'diagnostics' | 'approvals' | 'threads'
 
 const navigation: Array<{ id: View; label: string; icon: string }> = [
   { id: 'overview', label: 'Overview', icon: '◈' },
@@ -77,6 +93,8 @@ const navigation: Array<{ id: View; label: string; icon: string }> = [
   { id: 'notes', label: 'Notes', icon: '✎' },
   { id: 'knowledge', label: 'Knowledge', icon: '⌘' },
   { id: 'sources', label: 'Sources', icon: '◫' },
+  { id: 'tasks', label: 'Tasks', icon: '✓' },
+  { id: 'actions', label: 'Action queue', icon: '↗' },
   { id: 'calendar', label: 'Calendar', icon: '▦' },
   { id: 'mail', label: 'Mail', icon: '✉' },
   { id: 'agents', label: 'Agents', icon: '✦' },
@@ -89,6 +107,13 @@ const navigation: Array<{ id: View; label: string; icon: string }> = [
   { id: 'data', label: 'Data', icon: '⇩' },
 ]
 
+const navigationGroups: Array<{ label: string; items: Array<{ id: View; label: string; icon: string }> }> = [
+  { label: 'Workspace', items: navigation.filter((item) => ['overview', 'meetings', 'capture', 'notes', 'knowledge', 'sources', 'tasks', 'actions'].includes(item.id)) },
+  { label: 'Organize', items: navigation.filter((item) => ['calendar', 'mail', 'threads'].includes(item.id)) },
+  { label: 'Automate', items: navigation.filter((item) => ['agents', 'approvals'].includes(item.id)) },
+  { label: 'System', items: navigation.filter((item) => ['models', 'limits', 'diagnostics', 'data', 'three-d'].includes(item.id)) },
+]
+
 const capabilityLabels: Record<ModelCapability, string> = {
   chat: 'Conversation',
   transcription: 'Transcription',
@@ -98,16 +123,61 @@ const capabilityLabels: Record<ModelCapability, string> = {
 
 export function App() {
   const [view, setView] = useState<View>('overview')
+  const [sidebarOpen, setSidebarOpen] = useState(false)
   const [workspace, setWorkspace] = useState<Workspace>(loadSelectedWorkspace)
+  // Forward uncaught frontend errors into the on-disk application log so
+  // failures are visible in Diagnostics → Logs even from the web view.
+  useEffect(() => {
+    const onError = (event: ErrorEvent) => { logEvent('error', 'window', event.message) }
+    const onRejection = (event: PromiseRejectionEvent) => { logEvent('error', 'unhandledrejection', String(event.reason ?? 'unknown rejection')) }
+    window.addEventListener('error', onError)
+    window.addEventListener('unhandledrejection', onRejection)
+    return () => { window.removeEventListener('error', onError); window.removeEventListener('unhandledrejection', onRejection) }
+  }, [])
   const [settings, setSettings] = useState<LocalSettings>(loadSettings)
+  const [settingsHydrated, setSettingsHydrated] = useState(false)
   const [providerHealth, setProviderHealth] = useState<Record<ModelCapability, boolean>>(() => Object.fromEntries((Object.keys(providerStore) as ModelCapability[]).map((capability) => [capability, providerStore[capability].healthy])) as Record<ModelCapability, boolean>)
   const [showComposer, setShowComposer] = useState(false)
+  const [pendingApprovals, setPendingApprovals] = useState(0)
+  const notifiedApprovalIds = useRef<Set<string>>(new Set())
+  useEffect(() => {
+    const checkApprovals = async () => {
+      try {
+        const requests = await listPendingApprovals(workspace.id)
+        setPendingApprovals(requests.length)
+        const pendingIds = new Set(requests.map((request) => request.id))
+        for (const id of notifiedApprovalIds.current) if (!pendingIds.has(id)) notifiedApprovalIds.current.delete(id)
+        for (const req of requests) {
+          if (!notifiedApprovalIds.current.has(req.id)) {
+            notifiedApprovalIds.current.add(req.id)
+            try { sendNotification({ title: 'Approval requested', body: `${req.capability}: ${req.action_description}` }) } catch (error) { logEvent('error', 'approvals', `notification failed for ${req.id}: ${errMsg(error)}`) }
+          }
+        }
+      } catch (error) { logEvent('error', 'approvals', `poll failed for workspace ${workspace.id}: ${errMsg(error)}`) }
+    }
+    const timer = window.setInterval(checkApprovals, 5000)
+    void checkApprovals()
+    return () => window.clearInterval(timer)
+  }, [workspace.id])
 
   useEffect(() => { saveSelectedWorkspace(workspace) }, [workspace])
   useEffect(() => { saveSettings(settings) }, [settings])
-  useEffect(() => { void loadNativeSetting('settings').then((value) => { if (value) setSettings(JSON.parse(value) as LocalSettings) }).catch(() => undefined) }, [])
-  useEffect(() => { void saveNativeSetting('settings', JSON.stringify(settings)).catch(() => undefined) }, [settings])
-  useEffect(() => { void loadNativeWorkspaces().then((nativeWorkspaces) => { if (nativeWorkspaces.length > 0) setWorkspace((current) => nativeWorkspaces.find((item) => item.id === current.id) ?? nativeWorkspaces[0]) }).catch(() => undefined) }, [])
+  useEffect(() => {
+    void loadNativeSetting('settings').then((value) => {
+      if (value) setSettings(JSON.parse(value) as LocalSettings)
+    }).catch((error) => { logEvent('error', 'settings', `load persisted settings failed: ${errMsg(error)}`) }).finally(() => setSettingsHydrated(true))
+  }, [])
+  useEffect(() => {
+    if (!settingsHydrated) return
+    void saveNativeSetting('settings', JSON.stringify(settings)).catch((error) => logEvent('error', 'settings', `save persisted settings failed: ${errMsg(error)}`))
+  }, [settings, settingsHydrated])
+  useEffect(() => {
+    void loadNativeWorkspaces().then((nativeWorkspaces) => {
+      if (nativeWorkspaces.length === 0) return
+      workspaceStore.splice(0, workspaceStore.length, ...nativeWorkspaces)
+      setWorkspace((current) => nativeWorkspaces.find((item) => item.id === current.id) ?? nativeWorkspaces[0])
+    }).catch((error) => logEvent('error', 'workspace', `load native workspaces failed: ${errMsg(error)}`))
+  }, [])
   const [newWorkspaceName, setNewWorkspaceName] = useState('')
   const addWorkspace = async () => { const name = newWorkspaceName.trim(); if (!name) return; try { const created = await createWorkspace(name); workspaceStore.push(created); setWorkspace(created); setNewWorkspaceName('') } catch { /* Native workspace creation reports errors through its command boundary. */ } }
   useEffect(() => {
@@ -116,36 +186,55 @@ export function App() {
     }
   }, [])
 
+  const currentViewLabel = view === 'overview' ? 'Overview' : navigation.find((item) => item.id === view)?.label ?? 'Settings'
+  const todayLabel = new Intl.DateTimeFormat(undefined, { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric' }).format(new Date())
+  const hour = new Date().getHours()
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening'
+  const navigate = (nextView: View) => { setView(nextView); setSidebarOpen(false) }
+
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand"><span className="brand-mark">N</span><span>neural<span className="brand-muted">/os</span></span></div>
+    <div className={`app-shell ${sidebarOpen ? 'sidebar-open' : ''}`}>
+      <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />
+      <aside className="sidebar" aria-label="Application navigation">
+        <div className="brand"><span className="brand-mark">N</span><span>neural<span className="brand-muted">/os</span></span><button className="sidebar-close" aria-label="Close navigation" onClick={() => setSidebarOpen(false)}>×</button></div>
         <div className="workspace-switcher">
           <span className="eyebrow">Active workspace</span>
-          <select value={workspace.id} onChange={(event) => setWorkspace(workspaceStore.find((item) => item.id === event.target.value) ?? workspaceStore[0])}>
+          <select aria-label="Active workspace" value={workspace.id} onChange={(event) => setWorkspace(workspaceStore.find((item) => item.id === event.target.value) ?? workspaceStore[0])}>
             {workspaceStore.map((item) => <option value={item.id} key={item.id}>{item.name}</option>)}
           </select>
-          <span className="workspace-path">{workspace.sourceCount} connected sources</span><div style={{ display: 'flex', gap: '4px', marginTop: '8px' }}><input value={newWorkspaceName} onChange={(e) => setNewWorkspaceName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void addWorkspace() }} placeholder="New workspace name" style={{ flex: 1, minWidth: 0, border: '1px solid var(--line)', borderRadius: '6px', padding: '6px 8px', color: 'var(--soft)', background: 'transparent', font: '10px system-ui' }} /><button className="workspace-add" style={{ marginTop: 0 }} onClick={() => void addWorkspace()}>+ Add</button></div>
+          <span className="workspace-path">{workspace.sourceCount} connected sources</span>
+          <div className="workspace-create"><input aria-label="New workspace name" value={newWorkspaceName} onChange={(e) => setNewWorkspaceName(e.target.value)} onKeyDown={(e) => { if (e.key === 'Enter') void addWorkspace() }} placeholder="New workspace name" /><button className="workspace-add" onClick={() => void addWorkspace()} aria-label="Add workspace">+</button></div>
         </div>
         <nav className="nav-list" aria-label="Primary navigation">
-          {navigation.map((item) => <button className={`nav-item ${view === item.id ? 'active' : ''}`} key={item.id} onClick={() => setView(item.id)}><span className="nav-icon">{item.icon}</span>{item.label}</button>)}
+          {navigationGroups.map((group) => <div className="nav-group" key={group.label}><span className="nav-group-label">{group.label}</span>{group.items.map((item) => <button className={`nav-item ${view === item.id ? 'active' : ''}`} key={item.id} aria-current={view === item.id ? 'page' : undefined} onClick={() => navigate(item.id)}><span className="nav-icon" aria-hidden="true">{item.icon}</span><span>{item.label}</span>{item.id === 'approvals' && pendingApprovals > 0 && <span className="approval-badge" aria-label={`${pendingApprovals} pending approvals`}>{pendingApprovals}</span>}</button>)}</div>)}
         </nav>
         <div className="sidebar-footer">
-          <button className={`nav-item ${view === 'settings' ? 'active' : ''}`} onClick={() => setView('settings')}><span className="nav-icon">⚙</span>Settings</button>
-          <div className="profile"><div className="avatar">T</div><div><strong>Local profile</strong><span>Offline-first</span></div><span className="status-dot" /></div>
+          <button className={`nav-item ${view === 'settings' ? 'active' : ''}`} aria-current={view === 'settings' ? 'page' : undefined} onClick={() => navigate('settings')}><span className="nav-icon" aria-hidden="true">⚙</span><span>Settings</span></button>
+          <div className="profile"><div className="avatar" aria-hidden="true">T</div><div><strong>Local profile</strong><span>Offline-first</span></div><span className="status-dot" aria-label="Local engine connected" /></div>
         </div>
       </aside>
       <main className="main-content">
-        <header className="topbar"><div><span className="eyebrow">Sunday, August 9, 2026</span><h1>{view === 'overview' ? 'Good evening, Thrilok' : navigation.find((item) => item.id === view)?.label ?? 'Settings'}</h1></div><div className="topbar-actions"><span className="sync-label"><span className="status-dot" /> Local engine ready</span><button className="icon-button" aria-label="Notifications">♧</button><button className="primary-button" onClick={() => setShowComposer(true)}>+ Ask Neural</button></div></header>
-         {view === 'overview' ? <Overview workspace={workspace} onAsk={() => setShowComposer(true)} providerHealth={providerHealth} /> : view === 'settings' ? <Settings settings={settings} onChange={setSettings} /> : view === 'notes' ? <Notes workspace={workspace} /> : view === 'knowledge' ? <Knowledge workspace={workspace} /> : view === 'sources' ? <Sources workspace={workspace} /> : view === 'meetings' ? <Meetings workspace={workspace} /> : view === 'capture' ? <Capture settings={settings} /> : view === 'agents' ? <Agents workspace={workspace} /> : view === 'models' ? <Models workspace={workspace} /> : view === 'three-d' ? <ThreeDView workspace={workspace} /> : view === 'limits' ? <CostsView workspace={workspace} /> : view === 'diagnostics' ? <DiagnosticsView workspace={workspace} /> : view === 'approvals' ? <ApprovalsView workspace={workspace} /> : view === 'threads' ? <ThreadsView workspace={workspace} /> : view === 'data' ? <Data workspace={workspace} /> : view === 'calendar' ? <Calendar workspace={workspace} /> : view === 'mail' ? <Mail workspace={workspace} /> : <SectionView view={view} />}
+        <header className="topbar">
+          <div className="topbar-title"><button className="menu-button icon-button" aria-label="Open navigation" aria-expanded={sidebarOpen} onClick={() => setSidebarOpen(true)}>☰</button><div><span className="eyebrow">{todayLabel}</span><h1>{view === 'overview' ? `${greeting}, Thrilok` : currentViewLabel}</h1><span className="topbar-context">{workspace.name} · local workspace</span></div></div>
+          <div className="topbar-actions"><span className="sync-label"><span className="status-dot" /> Local engine ready</span><button className="icon-button" aria-label="Open approvals" title="Open approvals" onClick={() => navigate('approvals')}>♧{pendingApprovals > 0 && <span className="notification-dot" />}</button><button className="primary-button" onClick={() => setShowComposer(true)}>+ Ask Neural</button></div>
+        </header>
+         {view === 'overview' ? <Overview workspace={workspace} onAsk={() => setShowComposer(true)} onNavigate={navigate} providerHealth={providerHealth} /> : view === 'settings' ? <Settings settings={settings} onChange={setSettings} /> : view === 'notes' ? <Notes workspace={workspace} /> : view === 'knowledge' ? <Knowledge workspace={workspace} /> : view === 'sources' ? <Sources workspace={workspace} /> : view === 'tasks' ? <Tasks workspace={workspace} /> : view === 'actions' ? <ActionQueue workspace={workspace} /> : view === 'meetings' ? <Meetings workspace={workspace} /> : view === 'capture' ? <Capture settings={settings} /> : view === 'agents' ? <Agents workspace={workspace} /> : view === 'models' ? <Models workspace={workspace} /> : view === 'three-d' ? <ThreeDView workspace={workspace} /> : view === 'limits' ? <CostsView workspace={workspace} /> : view === 'diagnostics' ? <DiagnosticsView workspace={workspace} /> : view === 'approvals' ? <ApprovalsView workspace={workspace} /> : view === 'threads' ? <ThreadsView workspace={workspace} /> : view === 'data' ? <Data workspace={workspace} /> : view === 'calendar' ? <Calendar workspace={workspace} /> : view === 'mail' ? <Mail workspace={workspace} /> : <UnknownView view={view} />}
       </main>
       {showComposer && <AssistantComposer workspace={workspace} onClose={() => setShowComposer(false)} />}
     </div>
   )
 }
 
-function Overview({ workspace, onAsk, providerHealth }: { workspace: Workspace; onAsk: () => void; providerHealth: Record<ModelCapability, boolean> }) {
-  return <div className="page-grid"><section className="hero-card"><div className="hero-copy"><span className="eyebrow accent">Your context, in one place</span><h2>Make space for<br /><em>better thinking.</em></h2><p>Neural is quietly organizing {workspace.name.toLowerCase()} while you focus on what matters next.</p><button className="text-button" onClick={onAsk}>Start a conversation <span>↗</span></button></div><div className="orbital"><div className="orbital-ring ring-one" /><div className="orbital-ring ring-two" /><div className="orbital-core">N</div><span className="orbit-label label-one">context</span><span className="orbit-label label-two">memory</span><span className="orbit-label label-three">intent</span></div></section><section className="stats-row"><Stat value={String(workspace.sourceCount).padStart(2, '0')} label="Sources indexed" detail="this workspace" /><Stat value="03" label="Upcoming meetings" detail="next 7 days" /><Stat value="08" label="Open actions" detail="2 due today" /></section><section className="content-card activity-card"><div className="section-heading"><div><span className="eyebrow">Recent activity</span><h3>What Neural knows</h3></div><button className="quiet-button">View all ↗</button></div><div className="activity-list"><Activity icon="◉" title="Weekly product sync" meta="Meeting · 42 min transcript" time="Today, 16:20" tone="violet" /><Activity icon="⌁" title="Design brief / mobile assistant" meta="Document · 8 highlights" time="Today, 14:05" tone="amber" /><Activity icon="✦" title="Follow up with the research team" meta="Action item · Extracted from meeting" time="Yesterday" tone="green" /></div></section><section className="content-card routing-card"><div className="section-heading"><div><span className="eyebrow">Model routing</span><h3>Capability status</h3></div><button className="quiet-button">Configure ↗</button></div><div className="routing-list">{(Object.keys(capabilityLabels) as ModelCapability[]).map((capability) => <div className="routing-item" key={capability}><span>{capabilityLabels[capability]}</span><span className="model-name">{providerStore[capability].model}</span><span className={`pill ${providerStore[capability].local ? 'pill-local' : 'pill-cloud'}`}>{providerStore[capability].local ? 'Local' : 'Cloud'}</span><span className={`health-dot ${providerHealth[capability] ? 'healthy' : ''}`} title={providerHealth[capability] ? 'Provider available' : 'Provider unavailable'} /></div>)}</div></section></div>
+function Overview({ workspace, onAsk, onNavigate, providerHealth }: { workspace: Workspace; onAsk: () => void; onNavigate: (view: View) => void; providerHealth: Record<ModelCapability, boolean> }) {
+  const [snapshot, setSnapshot] = useState({ meetings: 0, actions: 0, tasks: 0 })
+  useEffect(() => {
+    let active = true
+    void Promise.all([listMeetings(workspace.id), listOpenActions(workspace.id), listTasks(workspace.id)]).then(([meetings, actions, tasks]) => {
+      if (active) setSnapshot({ meetings: meetings.length, actions: actions.length, tasks: tasks.filter((task) => task.status !== 'completed').length })
+    }).catch((error) => logEvent('error', 'overview', `snapshot load failed for workspace ${workspace.id}: ${errMsg(error)}`))
+    return () => { active = false }
+  }, [workspace.id])
+  return <div className="page-grid"><section className="hero-card"><div className="hero-copy"><span className="eyebrow accent">Your context, in one place</span><h2>Make space for<br /><em>better thinking.</em></h2><p>Neural is quietly organizing {workspace.name.toLowerCase()} while you focus on what matters next.</p><button className="text-button" onClick={onAsk}>Start a conversation <span>↗</span></button></div><div className="orbital"><div className="orbital-ring ring-one" /><div className="orbital-ring ring-two" /><div className="orbital-core">N</div><span className="orbit-label label-one">context</span><span className="orbit-label label-two">memory</span><span className="orbit-label label-three">intent</span></div></section><section className="stats-row"><Stat value={String(workspace.sourceCount).padStart(2, '0')} label="Sources indexed" detail="this workspace" /><button className="stat stat-button" onClick={() => onNavigate('meetings')}><strong>{String(snapshot.meetings).padStart(2, '0')}</strong><span><span>Meetings</span><small>this workspace</small></span></button><button className="stat stat-button" onClick={() => onNavigate('actions')}><strong>{String(snapshot.actions).padStart(2, '0')}</strong><span><span>Open actions</span><small>needs follow-up</small></span></button><button className="stat stat-button" onClick={() => onNavigate('tasks')}><strong>{String(snapshot.tasks).padStart(2, '0')}</strong><span><span>Open tasks</span><small>this workspace</small></span></button></section><section className="content-card activity-card"><div className="section-heading"><div><span className="eyebrow">Recent activity</span><h3>What Neural knows</h3></div><button className="quiet-button" onClick={() => onNavigate('actions')}>View all ↗</button></div><div className="activity-list"><Activity icon="◉" title="Weekly product sync" meta="Meeting · 42 min transcript" time="Today, 16:20" tone="violet" /><Activity icon="⌁" title="Design brief / mobile assistant" meta="Document · 8 highlights" time="Today, 14:05" tone="amber" /><Activity icon="✦" title="Follow up with the research team" meta="Action item · Extracted from meeting" time="Yesterday" tone="green" /></div></section><section className="content-card routing-card"><div className="section-heading"><div><span className="eyebrow">Model routing</span><h3>Capability status</h3></div><button className="quiet-button" onClick={() => onNavigate('models')}>Configure ↗</button></div><div className="routing-list">{(Object.keys(capabilityLabels) as ModelCapability[]).map((capability) => <div className="routing-item" key={capability}><span>{capabilityLabels[capability]}</span><span className="model-name">{providerStore[capability].model}</span><span className={`pill ${providerStore[capability].local ? 'pill-local' : 'pill-cloud'}`}>{providerStore[capability].local ? 'Local' : 'Cloud'}</span><span className={`health-dot ${providerHealth[capability] ? 'healthy' : ''}`} title={providerHealth[capability] ? 'Provider available' : 'Provider unavailable'} /></div>)}</div></section></div>
 }
 
 function Notes({ workspace }: { workspace: Workspace }) {
@@ -177,7 +266,7 @@ function Notes({ workspace }: { workspace: Workspace }) {
 
 function Stat({ value, label, detail }: { value: string; label: string; detail: string }) { return <div className="stat"><strong>{value}</strong><div><span>{label}</span><small>{detail}</small></div></div> }
 function Activity({ icon, title, meta, time, tone }: { icon: string; title: string; meta: string; time: string; tone: string }) { return <div className="activity-item"><span className={`activity-icon ${tone}`}>{icon}</span><div><strong>{title}</strong><span>{meta}</span></div><time>{time}</time></div> }
-function SectionView({ view }: { view: View }) { return <section className="empty-section"><span className="eyebrow">Foundation in progress</span><h2>{view === 'settings' ? 'Everything stays in your hands.' : 'This space is ready for your context.'}</h2><p>The local data layer and provider contracts are being established first. This section will connect to the {view} workflow next.</p><button className="text-button">Review the implementation plan <span>↗</span></button></section> }
+function UnknownView({ view }: { view: View }) { return <section className="empty-section"><span className="eyebrow">Unknown view</span><h2>This view is not implemented.</h2><p><code>{view}</code> is not a known workspace view — check the navigation configuration.</p></section> }
 
 function Settings({ settings, onChange }: { settings: LocalSettings; onChange: (settings: LocalSettings) => void }) {
   const update = <K extends keyof LocalSettings>(key: K, value: LocalSettings[K]) => onChange({ ...settings, [key]: value })
@@ -228,7 +317,8 @@ function Knowledge({ workspace }: { workspace: Workspace }) {
   const compileBrief = async () => { if (!query.trim()) return setBrief(''); setWorking(true); setMessage('Compiling research brief...'); try { setBrief(await researchBrief(workspace.id, query)); setMessage('Research brief ready.') } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
   const [duplicates, setDuplicates] = useState<DuplicateGroup[]>([])
   const scanDuplicates = async () => { setWorking(true); setMessage('Comparing source content hashes...'); try { const groups = await findDuplicates(workspace.id); setDuplicates(groups); setMessage(groups.length ? `${groups.length} duplicate group${groups.length === 1 ? '' : 's'} found.` : 'No duplicate sources found.') } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
-  return <section className="knowledge-section"><div className="knowledge-header"><div><span className="eyebrow accent">{workspace.name} workspace</span><h2>Give Neural<br /><em>something to learn.</em></h2><p>Connect local folders and web pages. Source files are recorded for parsing, chunking, embeddings, and cited retrieval.</p></div><div className="knowledge-glyph">⌘</div></div><div className="ingestion-panel"><span className="eyebrow">Designated folder</span><h3>Scan local sources</h3><p>Supported now: PDF, Markdown, text, DOCX, HTML, JSON, and CSV.</p><div className="ingestion-form"><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="/Users/you/Documents/research" onKeyDown={(event) => { if (event.key === 'Enter') void scan() }} /><button className="primary-button" disabled={working} onClick={() => void scan()}>{working ? 'Scanning...' : 'Scan folder'}</button></div></div><div className="ingestion-panel"><span className="eyebrow">Web page</span><h3>Import from URL</h3><p>Enter any public URL to extract its text content and add it to your searchable knowledge base.</p><div className="ingestion-form"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/article" onKeyDown={(event) => { if (event.key === 'Enter') void fetchPage() }} /><button className="primary-button" disabled={working} onClick={() => void fetchPage()}>{working ? 'Fetching...' : 'Import page'}</button></div></div><button className="text-button" disabled={working} onClick={() => void index()}>Build searchable index <span>↗</span></button><button className="text-button" disabled={working} onClick={() => void embed()}>Create semantic embeddings <span>↗</span></button>{message && <span className="ingestion-message">{message}</span>}<div className="search-panel"><span className="eyebrow">Cited retrieval</span><h3>Search your context</h3><div className="ingestion-form"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="What did we decide about the assistant?" onKeyDown={(event) => { if (event.key === 'Enter') void search() }} /><button className="primary-button" disabled={working} onClick={() => void search()}>Keyword</button><button className="quiet-button" disabled={working} onClick={() => void semanticSearch()}>Semantic ↗</button><button className="quiet-button" disabled={working} onClick={() => void hybridSearchAll()}>Hybrid ↗</button><button className="quiet-button" disabled={working} onClick={() => void compileBrief()}>Research ↗</button></div>{brief && <pre style={{ whiteSpace: 'pre-wrap', fontSize: '11px', lineHeight: 1.6, maxHeight: '280px', overflow: 'auto', border: '1px solid var(--line)', borderRadius: '8px', padding: '12px', marginTop: '10px' }}>{brief}</pre>}<button className="text-button" disabled={working} onClick={() => void scanDuplicates()}>Find duplicate sources <span>↗</span></button>{duplicates.length > 0 && <div className="duplicate-list">{duplicates.map((group) => <article className="search-result" key={group.content_hash}><div><strong>{group.source_count} sources with identical content</strong><span>{group.sources.map((s) => `${s.title} (${s.uri ?? 'no uri'})`).join(' · ')}</span></div></article>)}</div>}{results.length > 0 && <div className="search-results">{results.map((result) => <article className="search-result" key={result.chunk_id}><div><strong>{result.title}</strong><span>{result.content}</span></div><code>{result.uri}</code></article>)}</div>}</div></section>
+  const deleteDuplicates = async (group: DuplicateGroup) => { if (!await nativeConfirm(`Delete ${group.sources.length - 1} duplicate source(s) and their derived data, keeping the first?`)) return; setWorking(true); try { for (const extra of group.sources.slice(1)) { await deleteSource(extra.id) } setDuplicates((current) => current.filter((g) => g.content_hash !== group.content_hash)); setMessage(`Removed ${group.sources.length - 1} duplicate source${group.sources.length - 1 === 1 ? '' : 's'}.`) } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
+  return <section className="knowledge-section"><div className="knowledge-header"><div><span className="eyebrow accent">{workspace.name} workspace</span><h2>Give Neural<br /><em>something to learn.</em></h2><p>Connect local folders and web pages. Source files are recorded for parsing, chunking, embeddings, and cited retrieval.</p></div><div className="knowledge-glyph">⌘</div></div><div className="ingestion-panel"><span className="eyebrow">Designated folder</span><h3>Scan local sources</h3><p>Supported now: PDF, Markdown, text, DOCX, HTML, JSON, and CSV.</p><div className="ingestion-form"><input value={directory} onChange={(event) => setDirectory(event.target.value)} placeholder="/Users/you/Documents/research" onKeyDown={(event) => { if (event.key === 'Enter') void scan() }} /><button className="primary-button" disabled={working} onClick={() => void scan()}>{working ? 'Scanning...' : 'Scan folder'}</button></div></div><div className="ingestion-panel"><span className="eyebrow">Web page</span><h3>Import from URL</h3><p>Enter any public URL to extract its text content and add it to your searchable knowledge base.</p><div className="ingestion-form"><input value={url} onChange={(event) => setUrl(event.target.value)} placeholder="https://example.com/article" onKeyDown={(event) => { if (event.key === 'Enter') void fetchPage() }} /><button className="primary-button" disabled={working} onClick={() => void fetchPage()}>{working ? 'Fetching...' : 'Import page'}</button></div></div><button className="text-button" disabled={working} onClick={() => void index()}>Build searchable index <span>↗</span></button><button className="text-button" disabled={working} onClick={() => void embed()}>Create semantic embeddings <span>↗</span></button>{message && <span className="ingestion-message">{message}</span>}<div className="search-panel"><span className="eyebrow">Cited retrieval</span><h3>Search your context</h3><div className="ingestion-form"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="What did we decide about the assistant?" onKeyDown={(event) => { if (event.key === 'Enter') void search() }} /><button className="primary-button" disabled={working} onClick={() => void search()}>Keyword</button><button className="quiet-button" disabled={working} onClick={() => void semanticSearch()}>Semantic ↗</button><button className="quiet-button" disabled={working} onClick={() => void hybridSearchAll()}>Hybrid ↗</button><button className="quiet-button" disabled={working} onClick={() => void compileBrief()}>Research ↗</button></div>{brief && <pre style={{ whiteSpace: 'pre-wrap', fontSize: '11px', lineHeight: 1.6, maxHeight: '280px', overflow: 'auto', border: '1px solid var(--line)', borderRadius: '8px', padding: '12px', marginTop: '10px' }}>{brief}</pre>}<button className="text-button" disabled={working} onClick={() => void scanDuplicates()}>Find duplicate sources <span>↗</span></button>{duplicates.length > 0 && <div className="duplicate-list">{duplicates.map((group) => <article className="search-result" key={group.content_hash}><div><strong>{group.source_count} sources with identical content</strong><span>{group.sources.map((s) => `${s.title} (${s.uri ?? 'no uri'})`).join(' · ')}</span></div><button className="quiet-button" onClick={() => void deleteDuplicates(group)} style={{ marginTop: '8px' }}>Delete all but first</button></article>)}</div>}{results.length > 0 && <div className="search-results">{results.map((result) => <article className="search-result" key={`source-${result.chunk_id}`}><div><small className="result-kind">Indexed source</small><strong>{result.title}</strong><span>{result.content}</span></div><code>{result.uri}</code></article>)}</div>}</div></section>
 }
 
 function Sources({ workspace }: { workspace: Workspace }) {
@@ -240,7 +330,7 @@ function Sources({ workspace }: { workspace: Workspace }) {
 }
 
 function Capture({ settings }: { settings: LocalSettings }) {
-  const tsName = () => { const d = new Date(); const pad = (n: number) => String(n).padStart(2, '0'); return `~/Recordings/meeting-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}.m4a` }
+  const tsName = () => { const d = new Date(); const pad = (n: number) => String(n).padStart(2, '0'); return `~/Neural Agent OS/recordings/meeting-${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}.m4a` }
   const [path, setPath] = useState(tsName)
   const [pathTouched, setPathTouched] = useState(false)
   const [source, setSource] = useState('default')
@@ -251,21 +341,27 @@ function Capture({ settings }: { settings: LocalSettings }) {
   useEffect(() => { if (!active) { setElapsed(0); return }; const timer = window.setInterval(() => setElapsed((s) => s + 1), 1000); return () => window.clearInterval(timer) }, [active])
   const evaluate = async () => { try { setDecision(await checkRecordingAllowed(undefined, undefined, undefined, [])) } catch (error) { setDecision(null); setMessage(errMsg(error)) } }
   const start = async () => {
+    if (active) return
     try {
       // Timestamp-named output: unless the user customized the path, name the
       // file with the moment recording actually starts.
       const recordingPath = pathTouched ? path.trim() : tsName()
       if (!pathTouched) setPath(recordingPath)
-      const decision = await checkRecordingAllowed(undefined, undefined, undefined, [])
+      let decision: RecordingDecision
+      try { decision = await checkRecordingAllowed(undefined, undefined, undefined, []) } catch (error) {
+        logEvent('error', 'capture', `recording policy check failed: ${errMsg(error)}`)
+        setMessage('Recording blocked: recording policy could not be verified. Check Diagnostics and try again.')
+        return
+      }
       if (!decision.allowed) { setMessage(`Recording blocked: ${decision.reason}`); return }
       if (decision.action === 'confirm' && !await nativeConfirm('Start local recording? Confirm that all participants have been notified.')) return
       await startLocalRecording(recordingPath, source, { confirmed: decision.action !== 'automatic' })
       setActive(true)
       setMessage(settings.recordingNotice ? `Recording to ${recordingPath}. Visible recording notice enabled.` : `Recording to ${recordingPath}. Keep this window open until you stop.`)
-    } catch (error) { setMessage(errMsg(error)) }
+    } catch (error) { logEvent('error', 'capture', `start recording failed: ${errMsg(error)}`); setMessage(errMsg(error)) }
   }
-  const stop = async () => { try { const status = await stopLocalRecording(); setActive(false); setMessage(status.queued ? `Recording saved to ${path}. Transcription queued — it will run automatically.` : `Recording saved to ${path}.`) } catch (error) { setMessage(errMsg(error)) } }
-  return <section className="capture-section"><div className={`capture-orb ${active ? 'recording' : ''}`}>{active ? <span style={{ position: 'relative' }}>●<span style={{ position: 'absolute', inset: '-8px', border: '2px solid #ff8496', borderRadius: '50%', animation: 'pulse 1s infinite', opacity: .5 }} /></span> : <span>N</span>}</div><span className="eyebrow accent">Live capture</span><h2>{active ? `Recording · ${Math.floor(elapsed / 60).toString().padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}` : 'Capture a conversation.'}</h2><p>{active ? 'Conversation is being captured locally. The file will be ready for transcription when you stop.' : 'Record local microphone or system audio into a transcription-ready file. Configure consent notices before using this in shared meetings.'}</p><div className="capture-panel"><label>Output path<input value={path} onChange={(event) => { setPath(event.target.value); setPathTouched(true) }} disabled={active} placeholder="~/Recordings/meeting-YYYY-MM-DD_HH-MM-SS.m4a" /></label><label>Input source<select value={source} onChange={(event) => setSource(event.target.value)} disabled={active}><option value="default">Default microphone</option><option value="system">System audio</option></select></label><div className="capture-actions">{active ? <button className="primary-button" onClick={() => void stop()} style={{ background: '#ff8496', color: '#1c1529' }}>Stop recording</button> : <><button className="primary-button" onClick={() => void start()}>Start recording</button><button className="quiet-button" onClick={() => void evaluate()}>Check rules</button></>}<span className={`capture-status ${active ? 'live' : ''}`}>{active ? '● Live' : 'Ready'}</span></div>{decision && <span className="ingestion-message">Rule engine: {decision.allowed ? `${decision.action} — ${decision.reason}` : `blocked — ${decision.reason}`}</span>}{message && <span className="ingestion-message">{message}</span>}{active && <div style={{ marginTop: '20px', padding: '20px', border: '1px solid #493b60', borderRadius: '8px', background: '#1c1928' }}><span className="eyebrow accent">Meeting visualization</span><div style={{ display: 'flex', gap: '12px', marginTop: '12px', alignItems: 'center' }}><div style={{ width: '60px', height: '60px', borderRadius: '50%', background: 'linear-gradient(135deg, #bb9cff, #6f5b9f)', display: 'grid', placeItems: 'center', animation: 'pulse 2s infinite' }}>🎤</div><div style={{ fontSize: '11px', color: 'var(--soft)' }}><strong style={{ fontSize: '14px', display: 'block' }}>Active conversation</strong><span style={{ color: 'var(--muted)', marginTop: '4px', display: 'block' }}>Participants will be labeled during transcription</span></div></div></div>}</div></section>
+  const stop = async () => { if (!active) return; try { const status = await stopLocalRecording(); setActive(false); setMessage(status.queued ? `Recording saved to ${path}. Transcription queued — it will run automatically.` : `Recording saved to ${path}.`) } catch (error) { logEvent('error', 'capture', `stop recording failed: ${errMsg(error)}`); setMessage(errMsg(error)) } }
+  return <section className="capture-section"><div className={`capture-orb ${active ? 'recording' : ''}`}>{active ? <span style={{ position: 'relative' }}>●<span style={{ position: 'absolute', inset: '-8px', border: '2px solid #ff8496', borderRadius: '50%', animation: 'pulse 1s infinite', opacity: .5 }} /></span> : <span>N</span>}</div><span className="eyebrow accent">Live capture</span><h2>{active ? `Recording · ${Math.floor(elapsed / 60).toString().padStart(2, '0')}:${(elapsed % 60).toString().padStart(2, '0')}` : 'Capture a conversation.'}</h2><p>{active ? 'Conversation is being captured locally. The file will be ready for transcription when you stop.' : 'Record local microphone or system audio into a transcription-ready file. Configure consent notices before using this in shared meetings.'}</p><div className="capture-panel"><label>Output path<input value={path} onChange={(event) => { setPath(event.target.value); setPathTouched(true) }} disabled={active} placeholder="~/Neural Agent OS/recordings/meeting-YYYY-MM-DD_HH-MM-SS.m4a" /></label><label>Input source<select value={source} onChange={(event) => setSource(event.target.value)} disabled={active}><option value="default">Default microphone</option><option value="system">System audio</option><option value="combined">Microphone + System (combined)</option></select></label><div className="capture-actions">{active ? <button className="primary-button" onClick={() => void stop()} style={{ background: '#ff8496', color: '#1c1529' }}>Stop recording</button> : <><button className="primary-button" onClick={() => void start()}>Start recording</button><button className="quiet-button" onClick={() => void evaluate()}>Check rules</button></>}<span className={`capture-status ${active ? 'live' : ''}`}>{active ? '● Live' : 'Ready'}</span></div>{decision && <span className="ingestion-message">Rule engine: {decision.allowed ? `${decision.action} — ${decision.reason}` : `blocked — ${decision.reason}`}</span>}{message && <span className="ingestion-message">{message}</span>}{active && <div style={{ marginTop: '20px', padding: '20px', border: '1px solid #493b60', borderRadius: '8px', background: '#1c1928' }}><span className="eyebrow accent">Meeting visualization</span><div style={{ display: 'flex', gap: '12px', marginTop: '12px', alignItems: 'center' }}><div style={{ width: '60px', height: '60px', borderRadius: '50%', background: 'linear-gradient(135deg, #bb9cff, #6f5b9f)', display: 'grid', placeItems: 'center', animation: 'pulse 2s infinite' }}>🎤</div><div style={{ fontSize: '11px', color: 'var(--soft)' }}><strong style={{ fontSize: '14px', display: 'block' }}>Active conversation</strong><span style={{ color: 'var(--muted)', marginTop: '4px', display: 'block' }}>Participants will be labeled during transcription</span></div></div></div>}</div></section>
 }
 
 function Data({ workspace }: { workspace: Workspace }) {
@@ -278,8 +374,12 @@ function Data({ workspace }: { workspace: Workspace }) {
   const inspectDeletion = async () => { try { setDeletion(await previewWorkspaceDeletion(workspace.id)) } catch (error) { setMessage(errMsg(error)) } }
   const removeWorkspace = async () => { if (!deletion || !await nativeConfirm(`Delete ${deletion.workspace_name} and all listed derived data? This cannot be undone.`)) return; try { await deleteWorkspace(workspace.id); setMessage('Workspace deleted. Restart or select another workspace.') } catch (error) { setMessage(errMsg(error)) } }
   const [context, setContext] = useState('')
+  const [verifyPath, setVerifyPath] = useState('')
+  const [cleanupPreview, setCleanupPreview] = useState<string[] | null>(null)
   const exportCtx = async () => { setMessage('Compiling workspace context...'); try { const markdown = await exportContext(workspace.id); setContext(markdown); setMessage('Context export ready below (markdown).') } catch (error) { setMessage(errMsg(error)) } }
-  return <section className="data-section"><div className="empty-section task-intro"><span className="eyebrow accent">Local portability</span><h2>Keep your context<br /><em>movable.</em></h2><p>Export structured workspace data for backup, migration, or inspection. Recordings and large source files remain at their original paths.</p></div><div className="data-panel"><span className="eyebrow">Workspace export</span><h3>{workspace.name}</h3><label>Output JSON path<input value={path} onChange={(event) => setPath(event.target.value)} /></label><button className="primary-button" onClick={() => void exportData()}>Export workspace</button><span className="eyebrow">Restore export</span><label>Input JSON path<input value={importPath} onChange={(event) => setImportPath(event.target.value)} /></label><button className="quiet-button" onClick={() => void importData()}>Import workspace</button><span className="eyebrow">Context export</span><p>Markdown bundle of this workspace for coding agents (Claude Code, Codex, OpenCode).</p><button className="quiet-button" onClick={() => void exportCtx()}>Export context</button>{context && <pre style={{ whiteSpace: 'pre-wrap', fontSize: '11px', lineHeight: 1.6, maxHeight: '320px', overflow: 'auto', border: '1px solid var(--line)', borderRadius: '8px', padding: '12px' }}>{context}</pre>}<span className="eyebrow">Deletion review</span><p>Review related records before removing this workspace.</p><button className="quiet-button" onClick={() => void inspectDeletion()}>Preview deletion</button>{deletion && <div className="deletion-preview"><strong>{deletion.workspace_name}</strong><span>{deletion.sources} sources · {deletion.meetings} meetings · {deletion.transcript_segments} transcript segments</span><span>{deletion.tasks} tasks · {deletion.reminders} reminders · {deletion.notes} notes · {deletion.emails} emails · {deletion.agents} agents</span>{deletion.recordings.length > 0 && <span>{deletion.recordings.length} recording files remain at their original paths.</span>}<button className="quiet-button" onClick={() => void removeWorkspace()}>Delete workspace and database records</button></div>}{message && <span className="ingestion-message">{message}</span>}</div></section>
+  const verifyBackupFile = async () => { if (!verifyPath.trim()) return setMessage('Enter a backup JSON path to verify.'); try { const ok = await verifyBackup(verifyPath.trim()); setMessage(ok ? 'Backup file is valid.' : 'Backup file is INVALID (missing version/workspace_id/exported_at).') } catch (error) { setMessage(errMsg(error)) } }
+  const previewCleanup = async () => { setMessage('Scanning for old recordings...'); try { const list = await cleanupOldRecordings(30, true); setCleanupPreview(list); setMessage(list.length ? `${list.length} recording(s) older than 30 days would be removed.` : 'No old recordings to clean up.') } catch (error) { setMessage(errMsg(error)) } }
+  return <section className="data-section"><div className="empty-section task-intro"><span className="eyebrow accent">Local portability</span><h2>Keep your context<br /><em>movable.</em></h2><p>Export structured workspace data for backup, migration, or inspection. Recordings and large source files remain at their original paths.</p></div><div className="data-panel"><span className="eyebrow">Workspace export</span><h3>{workspace.name}</h3><label>Output JSON path<input value={path} onChange={(event) => setPath(event.target.value)} /></label><button className="primary-button" onClick={() => void exportData()}>Export workspace</button><span className="eyebrow">Restore export</span><label>Input JSON path<input value={importPath} onChange={(event) => setImportPath(event.target.value)} /></label><button className="quiet-button" onClick={() => void importData()}>Import workspace</button><span className="eyebrow">Context export</span><p>Markdown bundle of this workspace for coding agents (Claude Code, Codex, OpenCode).</p><button className="quiet-button" onClick={() => void exportCtx()}>Export context</button>{context && <pre style={{ whiteSpace: 'pre-wrap', fontSize: '11px', lineHeight: 1.6, maxHeight: '320px', overflow: 'auto', border: '1px solid var(--line)', borderRadius: '8px', padding: '12px' }}>{context}</pre>}<span className="eyebrow">Backup verification</span><p>Validate an exported backup JSON file.</p><div style={{ display: 'flex', gap: '8px', marginTop: '8px' }}><input value={verifyPath} onChange={(e) => setVerifyPath(e.target.value)} placeholder="/path/to/backup.json" style={{ flex: 1, background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '7px', font: '11px DM Mono' }} /><button className="quiet-button" onClick={() => void verifyBackupFile()}>Verify</button></div><span className="eyebrow">Retention preview</span><p>Preview which recordings would be cleaned up (30-day policy).</p><button className="quiet-button" onClick={() => void previewCleanup()}>Preview cleanup</button>{cleanupPreview && cleanupPreview.length > 0 && <div style={{ marginTop: '8px', fontSize: '11px', color: 'var(--soft)', maxHeight: '160px', overflow: 'auto' }}>{cleanupPreview.slice(0, 20).map((item, i) => <div key={i} style={{ padding: '2px 0' }}>{item}</div>)}{cleanupPreview.length > 20 ? `… and ${cleanupPreview.length - 20} more` : ''}</div>}<span className="eyebrow">Deletion review</span><p>Review related records before removing this workspace.</p><button className="quiet-button" onClick={() => void inspectDeletion()}>Preview deletion</button>{deletion && <div className="deletion-preview"><strong>{deletion.workspace_name}</strong><span>{deletion.sources} sources · {deletion.meetings} meetings · {deletion.transcript_segments} transcript segments</span><span>{deletion.tasks} tasks · {deletion.reminders} reminders · {deletion.notes} notes · {deletion.emails} emails · {deletion.agents} agents</span>{deletion.recordings.length > 0 && <span>{deletion.recordings.length} recording files remain at their original paths.</span>}<button className="quiet-button" onClick={() => void removeWorkspace()}>Delete workspace and database records</button></div>}{message && <span className="ingestion-message">{message}</span>}</div></section>
 }
 
 function Meetings({ workspace }: { workspace: Workspace }) {
@@ -290,6 +390,7 @@ function Meetings({ workspace }: { workspace: Workspace }) {
   const [working, setWorking] = useState(false)
   const [transcript, setTranscript] = useState<{ meeting: Meeting; segments: TranscriptSegment[] } | null>(null)
   const [summary, setSummary] = useState('')
+  const [summaryMeetingId, setSummaryMeetingId] = useState('')
   const [summaryActions, setSummaryActions] = useState<MeetingSummary['actions']>([])
   const [detected, setDetected] = useState<DetectedMeeting[]>([])
   const [voiceProfiles, setVoiceProfiles] = useState<VoiceProfile[]>([])
@@ -302,31 +403,85 @@ function Meetings({ workspace }: { workspace: Workspace }) {
     return () => window.clearInterval(timer)
   }, [workspace.id])
   const detect = async () => { try { setDetected(await detectUpcomingMeetings(workspace.id, 48)) } catch (error) { setMessage(errMsg(error)) } }
-  const importRecording = async () => { if (!path.trim()) return setMessage('Enter a local recording path.'); setWorking(true); try { const meeting = await importMeetingRecording(workspace.id, path.trim(), title.trim() || 'Imported meeting'); setMeetings((current) => [meeting, ...current]); setPath(''); setMessage('Recording registered and ready for transcription.') } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
-  const transcribe = async (meeting: Meeting) => { setWorking(true); try { const job = await queueTranscription(meeting.id); setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'transcription_queued' } : item)); setMessage(`Transcription queued for ${meeting.title}.`); await processTranscriptionJob(job.id); setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'transcribed' } : item)); setMessage(`${meeting.title} transcription completed.`) } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
-  const openTranscript = async (meeting: Meeting) => { setWorking(true); try { setTranscript({ meeting, segments: await listTranscriptSegments(meeting.id) }) } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
-  const summarize = async (meeting: Meeting) => { setWorking(true); setMessage('Asking the local model to summarize...'); try { const result = await summarizeMeeting(meeting.id); setSummary(`${result.summary}${result.actions.length ? `\n\nAction items\n${result.actions.map((action) => `- ${action.title}`).join('\n')}` : ''}`); setSummaryActions(result.actions); setMessage(result.actions.length ? `${result.actions.length} action items saved locally.` : 'Summary saved locally.') } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
+  const importRecording = async () => { if (!path.trim()) return setMessage('Enter a local recording path.'); setWorking(true); logEvent('info', 'meetings', `import recording ${path.trim()}`); try { const meeting = await importMeetingRecording(workspace.id, path.trim(), title.trim() || 'Imported meeting'); logEvent('info', 'meetings', `imported meeting ${meeting.id}`); setMeetings((current) => [meeting, ...current]); setPath(''); setMessage('Recording registered and ready for transcription.') } catch (error) { logEvent('error', 'meetings', `import failed: ${errMsg(error)}`); setMessage(errMsg(error)) } finally { setWorking(false) } }
+  const [transcribeLanguage, setTranscribeLanguage] = useState<AssistantLanguage>('en')
+  const transcribe = async (meeting: Meeting) => { setWorking(true); logEvent('info', 'meetings', `transcribe ${meeting.id} (${meeting.title}) language=${transcribeLanguage}`); try { const job = await queueTranscription(meeting.id, 'local-whisper', transcribeLanguage); setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'transcription_queued', language: transcribeLanguage } : item)); setMessage(`Transcription queued for ${meeting.title} (${languageLabels[transcribeLanguage]}).`); await processTranscriptionJob(job.id); setMeetings((current) => current.map((item) => item.id === meeting.id ? { ...item, status: 'transcribed' } : item)); setMessage(`${meeting.title} transcription completed.`); logEvent('info', 'meetings', `transcribe ${meeting.id} completed`) } catch (error) { logEvent('error', 'meetings', `transcribe ${meeting.id} failed: ${errMsg(error)}`); setMessage(errMsg(error)) } finally { setWorking(false) } }
+  const openTranscript = async (meeting: Meeting) => { setWorking(true); try { const [segments, stored] = await Promise.all([listTranscriptSegments(meeting.id), getMeetingSummary(meeting.id)]); setTranscript({ meeting, segments }); setSummaryMeetingId(meeting.id); if (stored) { setSummary(stored.summary); setSummaryActions(stored.actions) } else { setSummary(''); setSummaryActions([]) } } catch (error) { logEvent('error', 'meetings', `open transcript for ${meeting.id} failed: ${errMsg(error)}`); setMessage(errMsg(error)) } finally { setWorking(false) } }
+  const summarize = async (meeting: Meeting) => { setWorking(true); setMessage('Asking the local model to summarize...'); try { setSummaryMeetingId(meeting.id); const result = await summarizeMeeting(meeting.id); setSummary(`${result.summary}${result.actions.length ? `\n\nAction items\n${result.actions.map((action) => `- ${action.title}`).join('\n')}` : ''}`); setSummaryActions(result.actions); setMessage(result.actions.length ? `${result.actions.length} action items saved locally.` : 'Summary saved locally.') } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
   const promote = async (action: MeetingSummary['actions'][number]) => { try { await promoteAction(action.id, workspace.id); setSummaryActions((current) => current.map((item) => item.id === action.id ? { ...item, status: 'promoted' } : item)); setMessage('Action promoted to the workspace task list.') } catch (error) { setMessage(errMsg(error)) } }
   const renameSpeaker = async (segment: TranscriptSegment, speaker: string) => { const updated = { ...segment, speaker }; setTranscript((current) => current ? { ...current, segments: current.segments.map((item) => item.id === segment.id ? updated : item) } : current); try { await updateTranscriptSpeaker(segment.id, speaker); const existing = voiceProfiles.find((p) => p.speaker_label.toLowerCase() === speaker.toLowerCase()); if (existing) { await linkTranscriptToProfile(segment.id, existing.id); setVoiceProfiles((cur) => cur.map((p) => p.id === existing.id ? { ...p, sample_count: p.sample_count + 1 } : p)) } else if (speaker.trim()) { const profile = await createVoiceProfile(workspace.id, speaker.trim()); setVoiceProfiles((cur) => [...cur, profile]); await linkTranscriptToProfile(segment.id, profile.id) } } catch { setMessage('Speaker label could not be saved.') } }
   const editSegmentText = async (segment: TranscriptSegment, text: string) => { setTranscript((current) => current ? { ...current, segments: current.segments.map((item) => item.id === segment.id ? { ...item, text } : item) } : current); try { await updateTranscriptSegmentText(segment.id, text) } catch (error) { setMessage(errMsg(error)) } }
-  const reprocess = async (meeting: Meeting) => { setWorking(true); try { const job = await reprocessTranscription(meeting.id); setMessage(`Transcription re-queued for ${meeting.title} (${job.status}).`) } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
+  const deleteStoredSummary = async (meetingId: string) => {
+    if (!await nativeConfirm('Delete this meeting\u2019s stored summary and action items?')) return
+    try { await deleteMeetingSummary(meetingId); await deleteMeetingActions(meetingId); setSummary(''); setSummaryActions([]); setMessage('Summary deleted. Re-run Summarize to regenerate.') } catch (error) { logEvent('error', 'meetings', `delete summary for ${meetingId} failed: ${errMsg(error)}`); setMessage(errMsg(error)) }
+  }
+  const deleteStoredTranscript = async (meetingId: string) => {
+    if (!await nativeConfirm('Delete this meeting\u2019s transcript segments? The recording is kept. You can reprocess later.')) return
+    try { await deleteTranscriptSegments(meetingId); setTranscript((current) => current && current.meeting.id === meetingId ? { ...current, segments: [] } : current); setMessage('Transcript deleted.') } catch (error) { logEvent('error', 'meetings', `delete transcript for ${meetingId} failed: ${errMsg(error)}`); setMessage(errMsg(error)) }
+  }
+  const reprocess = async (meeting: Meeting) => { setWorking(true); logEvent('info', 'meetings', `reprocess transcription ${meeting.id} language=${transcribeLanguage}`); try { const job = await reprocessTranscription(meeting.id, 'local-whisper', transcribeLanguage); setMessage(`Transcription re-queued for ${meeting.title} (${job.status}).`) } catch (error) { logEvent('error', 'meetings', `reprocess ${meeting.id} failed: ${errMsg(error)}`); setMessage(errMsg(error)) } finally { setWorking(false) } }
   const [batchPaths, setBatchPaths] = useState('')
   const [botRuns, setBotRuns] = useState<BotRun[]>([])
+  const [recordingRules, setRecordingRules] = useState<RecordingRule[]>([])
+  const [ruleType, setRuleType] = useState('calendar')
+  const [rulePattern, setRulePattern] = useState('')
+  const [ruleAction, setRuleAction] = useState('automatic')
+  const [rulePriority, setRulePriority] = useState('1')
+  useEffect(() => { void listRecordingRules(workspace.id).then(setRecordingRules).catch((error) => logEvent('error', 'meetings', `list recording rules failed: ${errMsg(error)}`)) }, [workspace.id])
+  const addRecordingRule = async () => {
+    if (!rulePattern.trim()) return setMessage('Enter a rule pattern (e.g. a title keyword or domain).')
+    try { await setRecordingRule(workspace.id, ruleType, rulePattern.trim(), ruleAction, Number(rulePriority) || 1); setRulePattern(''); setRecordingRules(await listRecordingRules(workspace.id)); setMessage('Recording rule saved — automatic matching starts on the next scheduler tick.') } catch (error) { logEvent('error', 'meetings', `set recording rule failed: ${errMsg(error)}`); setMessage(errMsg(error)) }
+  }
+  const removeRecordingRule = async (rule: RecordingRule) => {
+    if (!await nativeConfirm(`Delete recording rule "${rule.rule_type}: ${rule.pattern}"?`)) return
+    try { await deleteRecordingRule(rule.id); setRecordingRules((current) => current.filter((item) => item.id !== rule.id)); setMessage('Recording rule deleted.') } catch (error) { logEvent('error', 'meetings', `delete recording rule failed: ${errMsg(error)}`); setMessage(errMsg(error)) }
+  }
+  const [queueStatus, setQueueStatus] = useState<JobQueueStatus | null>(null)
+  const [jobs, setJobs] = useState<BackgroundJob[]>([])
+  const [activeJobs, setActiveJobs] = useState(true)
   useEffect(() => { void import('./data/botRuns').then((m) => m.listBotRuns(workspace.id)).then(setBotRuns).catch(() => setBotRuns([])) }, [workspace.id])
+  const refreshQueue = useCallback(() => {
+    void getQueueStatus(workspace.id).then(setQueueStatus).catch(() => setQueueStatus(null))
+    void listJobs(workspace.id).then((j) => { setJobs(j.filter((x) => x.status === 'queued' || x.status === 'running' || x.status === 'failed')); setActiveJobs(j.some((x) => x.status === 'queued' || x.status === 'running')) }).catch(() => setJobs([]))
+  }, [workspace.id])
+  useEffect(() => {
+    refreshQueue()
+    const timer = window.setInterval(refreshQueue, 8000)
+    return () => window.clearInterval(timer)
+  }, [refreshQueue])
+  const cancelJobById = async (jobId: string) => { try { const cancelled = await cancelJob(jobId); setMessage(cancelled ? 'Job cancelled.' : 'Job was already finished.'); refreshQueue(); logEvent('info', 'meetings', `cancelled job ${jobId}: ${cancelled}`) } catch (error) { logEvent('error', 'meetings', `cancel job ${jobId} failed: ${errMsg(error)}`); setMessage(errMsg(error)) } }
+  // Drag-and-drop import: the backend imports dropped audio/video files and
+  // queues transcription, then emits `recording-dropped` with the count.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined
+    void import('@tauri-apps/api/event').then(async ({ listen }) => {
+      unlisten = await listen<number>('recording-dropped', (event) => {
+        const n = event.payload
+        setMessage(n > 0 ? `${n} recording${n === 1 ? '' : 's'} imported — transcription queued automatically.` : 'No supported recordings found in the dropped files.')
+        void listMeetings(workspace.id).then(setMeetings).catch(() => setMeetings([]))
+      })
+    }).catch(() => undefined)
+    return () => { unlisten?.() }
+  }, [workspace.id])
   const batchImport = async () => { const paths = batchPaths.split('\n').map((p) => p.trim()).filter(Boolean); if (!paths.length) return setMessage('Enter at least one recording path (one per line).'); setWorking(true); try { const imported = await importMeetingRecordingsBatch(workspace.id, paths); setMeetings((current) => [...imported, ...current]); setBatchPaths(''); setMessage(`${imported.length} recording${imported.length === 1 ? '' : 's'} imported.`) } catch (error) { setMessage(errMsg(error)) } finally { setWorking(false) } }
   const removeProfile = async (profile: VoiceProfile) => { if (!await nativeConfirm(`Delete voice profile "${profile.speaker_label}"?`)) return; try { await deleteVoiceProfile(profile.id); setVoiceProfiles((cur) => cur.filter((p) => p.id !== profile.id)); setMessage('Voice profile deleted.') } catch (error) { setMessage(errMsg(error)) } }
-  return <section className="meetings-section"><div className="meetings-header"><div><span className="eyebrow accent">Meeting intelligence</span><h2>Every conversation,<br /><em>remembered.</em></h2><p>Import a local recording or detect upcoming calendar meetings. Transcription and speaker diarization will process meetings marked ready.</p></div><div className="meeting-wave">∿</div></div><div className="ingestion-panel"><span className="eyebrow">Calendar detection</span><h3>Upcoming meetings</h3><p>Scans your calendar events for meetings within the next 48 hours.</p><div style={{ marginTop: '15px', display: 'flex', gap: '10px', alignItems: 'center' }}><button className="primary-button" disabled={working} onClick={() => void detect()}>Scan calendar</button>{detected.length > 0 && <span className="pill pill-local">{detected.length} meeting{detected.length === 1 ? '' : 's'} found</span>}</div>{detected.length > 0 && <div style={{ marginTop: '12px', display: 'grid', gap: '6px' }}>{detected.map((d) => <div key={d.event_id} style={{ padding: '8px 12px', border: '1px solid var(--line)', borderRadius: '6px', fontSize: '11px' }}><strong>{d.title}</strong><span style={{ color: 'var(--muted)', marginLeft: '10px', font: '10px DM Mono' }}>{new Date(d.starts_at).toLocaleString()}</span>{d.meeting_url && <code style={{ display: 'block', marginTop: '4px', color: 'var(--accent)', font: '9px DM Mono', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.meeting_url}</code>}</div>)}</div>}</div><div className="ingestion-panel"><span className="eyebrow">Voice profiles</span><h3>Speaker identities</h3><p>Profiles are created when you label speakers. Sample counts grow with each correction.</p><div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>{voiceProfiles.length === 0 ? <span className="empty-list">No voice profiles yet. Label speakers in transcripts.</span> : voiceProfiles.map((p) => <span key={p.id} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><span className="pill pill-local" title={`${p.sample_count} samples`}>{p.speaker_label} · {p.sample_count}</span><button className="quiet-button" onClick={() => void removeProfile(p)} title="Delete voice profile" style={{ fontSize: '10px', padding: '2px 5px' }}>✕</button></span>)}</div></div>{botRuns.length > 0 && <div className="ingestion-panel"><span className="eyebrow">Teams bot</span><h3>Recent bot activity</h3><div style={{ display: 'grid', gap: '4px', fontSize: '11px' }}>{botRuns.slice(0, 5).map((run) => <div key={run.id} style={{ display: 'flex', gap: '8px', color: 'var(--soft)' }}><span className="pill pill-local" style={{ flexShrink: 0 }}>{run.status}</span><span>{run.message ?? run.meeting_id ?? run.bot_id}</span></div>)}</div></div>}<div className="ingestion-panel"><span className="eyebrow">Local recording</span><h3>Register audio or video</h3><div className="meeting-form"><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Meeting title" /><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/Users/you/recordings/meeting.m4a" onKeyDown={(event) => { if (event.key === 'Enter') void importRecording() }} /><button className="primary-button" disabled={working} onClick={() => void importRecording()}>{working ? 'Importing...' : 'Import recording'}</button></div><span className="eyebrow">Batch import</span><p>Add multiple recordings at once (one path per line).</p><textarea value={batchPaths} onChange={(event) => setBatchPaths(event.target.value)} placeholder={'/Users/you/recordings/a.m4a\n/Users/you/recordings/b.wav'} rows={2} style={{ width: '100%', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '8px', font: '11px DM Mono' }} /><button className="quiet-button" disabled={working} onClick={() => void batchImport()}>Import batch</button>{message && <span className="ingestion-message">{message}</span>}</div><div className="meeting-list">{meetings.length === 0 ? <div className="empty-list">No recordings registered in this workspace yet.</div> : meetings.map((meeting) => <article className="meeting-item" key={meeting.id}><span className="activity-icon violet">◉</span><div><strong>{meeting.title}</strong><span>{meeting.recording_path}</span></div>{meeting.status === 'ready_for_transcription' ? <button className="quiet-button" disabled={working} onClick={() => void transcribe(meeting)}>Queue transcription ↗</button> : meeting.status === 'transcribed' ? <><button className="quiet-button" disabled={working} onClick={() => void openTranscript(meeting)}>Read transcript ↗</button><button className="quiet-button" disabled={working} onClick={() => void summarize(meeting)}>Summarize ↗</button><button className="quiet-button" disabled={working} onClick={() => void reprocess(meeting)} title="Re-queue transcription with a different provider">Reprocess ↗</button></> : <span className="pill pill-local">{meeting.status.replaceAll('_', ' ')}</span>}</article>)}</div>{summary && <div className="summary-panel"><span className="eyebrow">Local model summary</span><div>{summary}</div></div>}{summaryActions.length > 0 && <div style={{ marginTop: '12px' }}>{summaryActions.map((action) => <div key={action.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', fontSize: '11px' }}><span style={{ flex: 1 }}>{action.title}</span><button className="quiet-button" onClick={() => void promote(action)} style={{ fontSize: '10px' }}>{action.status === 'promoted' ? '✓ Promoted' : 'Promote to task'}</button></div>)}</div>}{transcript && <div className="transcript-panel"><div className="section-heading"><div><span className="eyebrow">Transcript</span><h3>{transcript.meeting.title}</h3></div><button className="quiet-button" onClick={() => setTranscript(null)}>Close</button></div>{transcript.segments.length === 0 ? <div className="empty-list">No transcript segments found.</div> : transcript.segments.map((segment) => <div className="transcript-line" key={segment.id}><time>{formatTime(segment.start_seconds)}</time><div><input className="speaker-input" value={segment.speaker ?? ''} placeholder="Speaker name" onChange={(event) => void renameSpeaker(segment, event.target.value)} /><textarea className="segment-text" value={segment.text} rows={2} onChange={(event) => void editSegmentText(segment, event.target.value)} style={{ width: '100%', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '6px', font: '12px system-ui', marginTop: '4px' }} /></div></div>)}</div>}</section>
+  return <section className="meetings-section"><div className="meetings-header"><div><span className="eyebrow accent">Meeting intelligence</span><h2>Every conversation,<br /><em>remembered.</em></h2><p>Import a local recording or detect upcoming calendar meetings. Transcription and speaker diarization will process meetings marked ready.</p><div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginTop: '10px' }}><label style={{ fontSize: '10px', color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Transcribe in</label><select className="lang-select" value={transcribeLanguage} onChange={(event) => setTranscribeLanguage(event.target.value as AssistantLanguage)} title="Language for new transcriptions">{Object.entries(languageLabels).map(([code, label]) => <option key={code} value={code}>{code.toUpperCase()} · {label}</option>)}</select></div></div><div className="meeting-wave">∿</div></div><div className="ingestion-panel"><span className="eyebrow">Calendar detection</span><h3>Upcoming meetings</h3><p>Scans your calendar events for meetings within the next 48 hours.</p><div style={{ marginTop: '15px', display: 'flex', gap: '10px', alignItems: 'center' }}><button className="primary-button" disabled={working} onClick={() => void detect()}>Scan calendar</button>{detected.length > 0 && <span className="pill pill-local">{detected.length} meeting{detected.length === 1 ? '' : 's'} found</span>}</div>{detected.length > 0 && <div style={{ marginTop: '12px', display: 'grid', gap: '6px' }}>{detected.map((d) => <div key={d.event_id} style={{ padding: '8px 12px', border: '1px solid var(--line)', borderRadius: '6px', fontSize: '11px' }}><strong>{d.title}</strong><span style={{ color: 'var(--muted)', marginLeft: '10px', font: '10px DM Mono' }}>{new Date(d.starts_at).toLocaleString()}</span>{d.meeting_url && <code style={{ display: 'block', marginTop: '4px', color: 'var(--accent)', font: '9px DM Mono', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{d.meeting_url}</code>}</div>)}</div>}</div><div className="ingestion-panel"><span className="eyebrow">Voice profiles</span><h3>Speaker identities</h3><p>Profiles are created when you label speakers. Sample counts grow with each correction.</p><div style={{ marginTop: '12px', display: 'flex', gap: '8px', flexWrap: 'wrap', alignItems: 'center' }}>{voiceProfiles.length === 0 ? <span className="empty-list">No voice profiles yet. Label speakers in transcripts.</span> : voiceProfiles.map((p) => <span key={p.id} style={{ display: 'flex', alignItems: 'center', gap: '4px' }}><span className="pill pill-local" title={`${p.sample_count} samples`}>{p.speaker_label} · {p.sample_count}</span><button className="quiet-button" onClick={() => void removeProfile(p)} title="Delete voice profile" style={{ fontSize: '10px', padding: '2px 5px' }}>✕</button></span>)}</div></div>{botRuns.length > 0 && <div className="ingestion-panel"><span className="eyebrow">Teams bot</span><h3>Recent bot activity</h3><div style={{ display: 'grid', gap: '4px', fontSize: '11px' }}>{botRuns.slice(0, 5).map((run) => <div key={run.id} style={{ display: 'flex', gap: '8px', color: 'var(--soft)' }}><span className="pill pill-local" style={{ flexShrink: 0 }}>{run.status}</span><span>{run.message ?? run.meeting_id ?? run.bot_id}</span></div>)}</div></div>}<div className="ingestion-panel"><span className="eyebrow">Recording rules</span><h3>Automatic recording</h3><p>Meetings matching an "automatic" rule are recorded without prompting when they start; "confirm" meetings are left to you. Rules run by priority (1 = highest).</p><div className="ingestion-form"><select aria-label="Rule type" value={ruleType} onChange={(e) => setRuleType(e.target.value)} style={{ border: '1px solid var(--line)', borderRadius: '6px', padding: '8px', color: 'var(--soft)', background: '#10131a', font: '10px system-ui' }}><option value="calendar">Title contains</option><option value="domain">Domain</option><option value="participant">Participant</option></select><input aria-label="Rule pattern" value={rulePattern} onChange={(e) => setRulePattern(e.target.value)} placeholder="pattern (e.g. standup, zoom.us, alice)" style={{ flex: 1, minWidth: 0 }} /><select aria-label="Rule action" value={ruleAction} onChange={(e) => setRuleAction(e.target.value)} style={{ border: '1px solid var(--line)', borderRadius: '6px', padding: '8px', color: 'var(--soft)', background: '#10131a', font: '10px system-ui' }}><option value="automatic">Record automatically</option><option value="confirm">Ask first</option><option value="disabled">Never record</option><option value="notice_required">Record + notice</option></select><input aria-label="Priority" value={rulePriority} onChange={(e) => setRulePriority(e.target.value)} placeholder="1" type="number" min={1} style={{ width: 64 }} /><button className="primary-button" disabled={working} onClick={() => void addRecordingRule()}>Add rule</button></div>{recordingRules.length > 0 && <div style={{ display: 'grid', gap: '6px', marginTop: '16px' }}>{recordingRules.map((rule) => <div key={rule.id} style={{ display: 'flex', alignItems: 'center', gap: '10px', padding: '9px 12px', border: '1px solid var(--line)', borderRadius: '7px', fontSize: '11px' }}><span className="pill pill-local" style={{ flexShrink: 0 }}>{rule.action}</span><code style={{ color: 'var(--soft)', font: '10px DM Mono' }}>{rule.rule_type}: {rule.pattern}</code><small style={{ color: 'var(--muted)', marginLeft: 'auto' }}>priority {rule.priority}</small><button className="quiet-button" aria-label={`Delete rule ${rule.rule_type}: ${rule.pattern}`} onClick={() => void removeRecordingRule(rule)}>✕</button></div>)}</div>}</div><div className="ingestion-panel"><span className="eyebrow">Local recording</span><h3>Register audio or video</h3><div className="meeting-form"><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Meeting title" /><input value={path} onChange={(event) => setPath(event.target.value)} placeholder="/Users/you/recordings/meeting.m4a" onKeyDown={(event) => { if (event.key === 'Enter') void importRecording() }} /><button className="primary-button" disabled={working} onClick={() => void importRecording()}>{working ? 'Importing...' : 'Import recording'}</button></div><span className="eyebrow">Batch import</span><p>Add multiple recordings at once (one path per line).</p><textarea value={batchPaths} onChange={(event) => setBatchPaths(event.target.value)} placeholder={'/Users/you/recordings/a.m4a\n/Users/you/recordings/b.wav'} rows={2} style={{ width: '100%', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '8px', font: '11px DM Mono' }} /><button className="quiet-button" disabled={working} onClick={() => void batchImport()}>Import batch</button>{message && <span className="ingestion-message">{message}</span>}</div><div className="ingestion-panel"><span className="eyebrow">Processing queue</span><h3>Background pipeline</h3><p>Recordings are imported, transcribed, and summarized automatically — one at a time.</p><div style={{ display: 'flex', gap: '10px', marginTop: '8px', flexWrap: 'wrap' }}>{queueStatus && <><span className="pill pill-local">{queueStatus.queued} queued</span><span className="pill pill-local">{queueStatus.running} running</span><span className="pill pill-cloud">{queueStatus.failed} failed</span></>}{!activeJobs && jobs.length === 0 && <span style={{ color: 'var(--muted)', fontSize: '11px' }}>Queue idle — no pending work.</span>}</div>{jobs.length > 0 && <div style={{ display: 'grid', gap: '6px', marginTop: '10px' }}>{jobs.slice(0, 8).map((job) => <div key={job.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '11px', borderBottom: '1px solid var(--line)', padding: '4px 0' }}><span className={`pill ${job.status === 'failed' ? 'pill-cloud' : 'pill-local'}`}>{job.status}</span><span style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block' }}>{job.job_type}</strong><small style={{ color: job.status === 'failed' ? '#f1bd73' : 'var(--muted)' }}>{job.status === 'failed' ? (job.error || job.progress_message || `retry ${job.retry_count}/${job.max_retries}`) : (job.progress_message || job.error || `retry ${job.retry_count}/${job.max_retries}`)}</small></span><button className="quiet-button" onClick={() => void cancelJobById(job.id)} style={{ fontSize: '10px' }} title={job.status === 'running' ? 'Stop and cancel this job' : 'Cancel this job'}>{job.status === 'running' ? `Cancel ${job.progress_pct}%` : 'Cancel'}</button></div>)}</div>}</div><div className="meeting-list">{meetings.length === 0 ? <div className="empty-list">No recordings registered in this workspace yet.</div> : meetings.map((meeting) => <article className="meeting-item" key={meeting.id}><span className="activity-icon violet">◉</span><div><strong>{meeting.title}</strong><span>{meeting.recording_path}</span></div>{meeting.status === 'ready_for_transcription' || meeting.status === 'created' ? <><span className="pill pill-local">queued</span><button className="quiet-button" disabled={working} onClick={() => void transcribe(meeting)}>Queue now ↗</button></> : meeting.status === 'transcribed' ? <><button className="quiet-button" disabled={working} onClick={() => void openTranscript(meeting)}>Read transcript ↗</button><button className="quiet-button" disabled={working} onClick={() => void summarize(meeting)}>Summarize ↗</button><button className="quiet-button" disabled={working} onClick={() => void reprocess(meeting)} title="Re-queue transcription with a different provider">Reprocess ↗</button></> : meeting.status === 'transcription_failed' ? <><span className="pill pill-cloud">failed</span><button className="quiet-button" disabled={working} onClick={() => void reprocess(meeting)}>Retry ↗</button></> : <span className="pill pill-local">{meeting.status.replaceAll('_', ' ')}</span>}</article>)}</div>{summary && <div className="summary-panel"><div className="section-heading"><div><span className="eyebrow">Local model summary</span></div><div style={{ display: 'flex', gap: '8px' }}><button className="quiet-button" onClick={() => void deleteStoredSummary(summaryMeetingId)}>Delete summary</button></div></div><div>{summary}</div></div>}{summaryActions.length > 0 && <div style={{ marginTop: '12px' }}>{summaryActions.map((action) => <div key={action.id} style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '6px 0', fontSize: '11px' }}><span style={{ flex: 1 }}>{action.title}</span><button className="quiet-button" onClick={() => void promote(action)} style={{ fontSize: '10px' }}>{action.status === 'promoted' ? '✓ Promoted' : 'Promote to task'}</button></div>)}</div>}{transcript && <div className="transcript-panel"><div className="section-heading"><div><span className="eyebrow">Transcript</span><h3>{transcript.meeting.title}</h3></div><div style={{ display: 'flex', gap: '8px' }}><button className="quiet-button" onClick={() => void deleteStoredTranscript(transcript.meeting.id)}>Delete transcript</button><button className="quiet-button" onClick={() => setTranscript(null)}>Close</button></div></div>{transcript.segments.length === 0 ? <div className="empty-list">No transcript segments found.</div> : transcript.segments.map((segment) => <div className="transcript-line" key={segment.id}><time>{formatTime(segment.start_seconds)}</time><div style={{ display: 'flex', gap: '6px', alignItems: 'center', flexWrap: 'wrap' }}>{segment.confidence != null && <span className="pill pill-local" title="Transcription confidence">{Math.round(segment.confidence * 100)}% conf</span>}{segment.speaker_confidence != null && <span className="pill pill-cloud" title="Speaker assignment confidence">{Math.round(segment.speaker_confidence * 100)}% speaker</span>}<span className="pill pill-soft" title="Transcript language">{transcript.meeting.language ?? 'en'}</span></div><div><input className="speaker-input" value={segment.speaker ?? ''} placeholder="Speaker name" onChange={(event) => void renameSpeaker(segment, event.target.value)} /><textarea className="segment-text" value={segment.text} rows={2} onChange={(event) => void editSegmentText(segment, event.target.value)} style={{ width: '100%', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '6px', font: '12px system-ui', marginTop: '4px' }} /></div></div>)}</div>}</section>
 }
 
 /** Native confirm via the Tauri dialog plugin (window.confirm is not
- *  supported in WKWebView and silently returns false). */
+ *  supported in WKWebView and silently returns false). If no dialog is
+ *  available at all, we proceed rather than silently abort the action. */
 async function nativeConfirm(text: string): Promise<boolean> {
-  try { return await ask(text, { title: 'Neural Agent OS', kind: 'warning' }) } catch { return await nativeConfirm(text) }
+  try { return await ask(text, { title: 'Neural Agent OS', kind: 'warning' }) } catch { /* plugin unavailable */ }
+  try { return window.confirm(text) } catch { /* dialog unsupported */ }
+  // Fail closed: destructive actions must never proceed when confirmation is unavailable.
+  return false
 }
 
 /** Native alert via the Tauri dialog plugin. */
 async function nativeAlert(text: string): Promise<void> {
-  try { await message(text, { title: 'Neural Agent OS' }) } catch { void nativeAlert(text) }
+  try { await message(text, { title: 'Neural Agent OS' }); return } catch { /* plugin unavailable */ }
+  try { window.alert(text) } catch { /* dialog unsupported */ }
 }
 
 function errMsg(error: unknown): string {
@@ -406,25 +561,29 @@ function Agents({ workspace }: { workspace: Workspace }) {
 
 function Models({ workspace }: { workspace: Workspace }) {
   const capabilities = ['chat', 'transcription', 'embeddings', 'speech', 'summarization']
-  const defaults: Record<string, [string, string]> = { chat: ['Ollama', 'qwen3:14b'], transcription: ['Local', 'whisper-large-v3'], embeddings: ['Ollama', 'nomic-embed-text'], speech: ['OpenAI', 'tts-1'], summarization: ['Ollama', 'qwen3:14b'] }
+  const defaults: Record<string, [string, string]> = { chat: ['LM Studio', DEFAULT_LMSTUDIO_MODEL], transcription: ['Local', 'mlx-community/whisper-large-v3-turbo'], embeddings: ['LM Studio', DEFAULT_LMSTUDIO_EMBEDDING_MODEL], speech: ['OpenAI', 'tts-1'], summarization: ['LM Studio', DEFAULT_LMSTUDIO_MODEL] }
   const [routes, setRoutes] = useState<ModelRoute[]>([])
   const [message, setMessage] = useState('')
   useEffect(() => { void listModelRoutes(workspace.id).then(setRoutes).catch(() => setRoutes([])) }, [workspace.id])
   const save = async (capability: string, provider: string, model: string) => { try { const route = await setModelRoute(workspace.id, capability, provider, model); setRoutes((current) => [...current.filter((item) => item.capability !== capability), route]); setMessage(`${capability} now uses ${model}.`) } catch (error) { setMessage(errMsg(error)) } }
+  const download = async (capability: string, provider: string, model: string) => { const runtime = provider === 'ollama' ? 'ollama' : 'huggingface'; setMessage(`Downloading ${model} via ${runtime}...`); logEvent('info', 'models', `download ${model} runtime=${runtime} capability=${capability}`); try { const result = await downloadModel(runtime, model); logEvent('info', 'models', `download ${model} ok: ${result}`); setMessage(result) } catch (error) { logEvent('error', 'models', `download ${model} failed: ${errMsg(error)}`); setMessage(errMsg(error)) } }
   const [limits, setLimits] = useState<Record<string, number>>({})
   useEffect(() => { void Promise.all(capabilities.map(async (cap) => { try { const limit = await getTokenLimit(workspace.id, cap); if (limit != null) setLimits((current) => ({ ...current, [cap]: limit })) } catch { /* not configured */ } })) }, [workspace.id])
   const saveLimit = async (capability: string, limitTokens: number) => { try { await setTokenLimit(workspace.id, capability, limitTokens); setLimits((current) => ({ ...current, [capability]: limitTokens })); setMessage(`${capability} token limit set to ${limitTokens.toLocaleString()}.`) } catch (error) { setMessage(errMsg(error)) } }
+  const testConnection = async (providerId: string) => { setMessage(`Testing ${providerId}...`); try { const result = await testProviderConnection(providerId); setMessage(result.ok ? `${providerId} connected (HTTP ${result.http_status}).` : `${providerId} reachable but returned HTTP ${result.http_status}.`) } catch (error) { setMessage(errMsg(error)) } }
   const [apiKeys, setApiKeys] = useState<Record<string, string>>({})
   const saveApiKey = async (providerId: string, value: string) => { if (!value.trim()) return setMessage('Enter an API key first.'); try { await storeProviderSecret(providerId, 'api_key', value.trim()); setApiKeys((current) => ({ ...current, [providerId]: value.trim() })); setMessage(`${providerId} API key saved to the OS keychain.`) } catch (error) { setMessage(errMsg(error)) } }
   const clearApiKey = async (providerId: string) => { try { await deleteProviderSecret(providerId, 'api_key'); setApiKeys((current) => ({ ...current, [providerId]: '' })); setMessage(`${providerId} API key removed from the keychain.`) } catch (error) { setMessage(errMsg(error)) } }
-  return <section className="models-section"><div className="empty-section task-intro"><span className="eyebrow accent">Model control</span><h2>Choose the mind<br /><em>behind each skill.</em></h2><p>Routes are isolated by workspace. Keep sensitive capabilities local or select configured cloud providers when needed.</p>{message && <span className="ingestion-message">{message}</span>}</div><div className="model-list">{capabilities.map((capability) => { const route = routes.find((item) => item.capability === capability); const [defaultProvider, defaultModel] = defaults[capability]; return <ModelRouteEditor capability={capability} provider={route?.provider ?? defaultProvider} model={route?.model ?? defaultModel} onSave={save} key={capability} /> })}</div><div className="ingestion-panel"><span className="eyebrow">Token limits</span><h3>Per-capability ceilings</h3><p>Local runtimes are free; cloud capabilities respect these token limits on top of cost limits.</p>{capabilities.map((capability) => <div key={capability} style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '6px 0' }}><span style={{ width: '110px', fontSize: '11px' }}>{capability}</span><input type="number" min={0} value={limits[capability] ?? ''} placeholder="unlimited" onChange={(event) => void saveLimit(capability, Number(event.target.value) || 0)} style={{ width: '140px', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '6px' }} /></div>)}</div><div className="ingestion-panel"><span className="eyebrow">Provider runtimes</span><h3>Supported backends</h3><p>Set the base URL for local OpenAI-compatible runtimes (LM Studio, llama.cpp, vLLM) with <code>NEURAL_OPENAI_COMPATIBLE_URL</code>. Cloud providers are audited and gated by the data-sharing settings.</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '10px' }}>{providerOptions.map((option) => <span key={option.id} className={`pill ${option.kind === 'cloud' ? 'pill-cloud' : 'pill-local'}`} title={option.note}>{option.label}</span>)}</div></div><div className="ingestion-panel"><span className="eyebrow">Cloud API keys</span><h3>Provider credentials</h3><p>Keys are stored in the OS keychain and used by Ask Neural, agents, summaries, and email drafts when a cloud provider is selected. Local runtimes need no key.</p>{providerOptions.filter((option) => option.kind === 'cloud' || option.id === 'openai_compatible').map((option) => <div key={option.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '8px 0' }}><span style={{ width: '130px', fontSize: '11px' }}>{option.label}</span><input type="password" value={apiKeys[option.id] ?? ''} onChange={(event) => setApiKeys((current) => ({ ...current, [option.id]: event.target.value }))} placeholder="API key" style={{ flex: 1, background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '7px', font: '11px DM Mono' }} /><button className="quiet-button" onClick={() => void saveApiKey(option.id, apiKeys[option.id] ?? '')}>Save</button>{apiKeys[option.id] && <button className="quiet-button" onClick={() => void clearApiKey(option.id)} title="Remove key">✕</button>}</div>)}</div></section>
+  return <section className="models-section"><div className="empty-section task-intro"><span className="eyebrow accent">Model control</span><h2>Choose the mind<br /><em>behind each skill.</em></h2><p>Routes are isolated by workspace. Keep sensitive capabilities local or select configured cloud providers when needed.</p>{message && <span className="ingestion-message">{message}</span>}</div><div className="model-list">{capabilities.map((capability) => { const route = routes.find((item) => item.capability === capability); const [defaultProvider, defaultModel] = defaults[capability]; return <ModelRouteEditor capability={capability} provider={route?.provider ?? defaultProvider} model={route?.model ?? defaultModel} onSave={save} onDownload={download} key={capability} /> })}</div><div className="ingestion-panel"><span className="eyebrow">Token limits</span><h3>Per-capability ceilings</h3><p>Local runtimes are free; cloud capabilities respect these token limits on top of cost limits.</p>{capabilities.map((capability) => <div key={capability} style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '6px 0' }}><span style={{ width: '110px', fontSize: '11px' }}>{capability}</span><input type="number" min={0} value={limits[capability] ?? ''} placeholder="unlimited" onChange={(event) => void saveLimit(capability, Number(event.target.value) || 0)} style={{ width: '140px', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '6px' }} /></div>)}</div><div className="ingestion-panel"><span className="eyebrow">Provider runtimes</span><h3>Supported backends</h3><p>Set the base URL for local OpenAI-compatible runtimes (LM Studio, llama.cpp, vLLM) with <code>NEURAL_OPENAI_COMPATIBLE_URL</code>. Cloud providers are audited and gated by the data-sharing settings.</p><div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginTop: '10px' }}>{providerOptions.map((option) => <span key={option.id} className={`pill ${option.kind === 'cloud' ? 'pill-cloud' : 'pill-local'}`} title={option.note}>{option.label}</span>)}</div></div><div className="ingestion-panel"><span className="eyebrow">Cloud API keys</span><h3>Provider credentials</h3><p>Keys are stored in the OS keychain and used by Ask Neural, agents, summaries, and email drafts when a cloud provider is selected. Local runtimes need no key.</p>{providerOptions.filter((option) => option.kind === 'cloud' || option.id === 'openai_compatible').map((option) => <div key={option.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', margin: '8px 0', flexWrap: 'wrap' }}><span style={{ width: '130px', fontSize: '11px' }}>{option.label}</span><input type="password" value={apiKeys[option.id] ?? ''} onChange={(event) => setApiKeys((current) => ({ ...current, [option.id]: event.target.value }))} placeholder="API key" style={{ flex: 1, minWidth: '120px', background: 'transparent', border: '1px solid var(--line)', borderRadius: '6px', color: 'inherit', padding: '7px', font: '11px DM Mono' }} /><button className="quiet-button" onClick={() => void saveApiKey(option.id, apiKeys[option.id] ?? '')}>Save</button><button className="quiet-button" onClick={() => void testConnection(option.id)}>Test</button>{apiKeys[option.id] && <button className="quiet-button" onClick={() => void clearApiKey(option.id)} title="Remove key">✕</button>}</div>)}</div></section>
 }
 
-function ModelRouteEditor({ capability, provider, model, onSave }: { capability: string; provider: string; model: string; onSave: (capability: string, provider: string, model: string) => Promise<void> }) {
+function ModelRouteEditor({ capability, provider, model, onSave, onDownload }: { capability: string; provider: string; model: string; onSave: (capability: string, provider: string, model: string) => Promise<void>; onDownload: (capability: string, provider: string, model: string) => Promise<void> }) {
   const [nextProvider, setNextProvider] = useState(provider)
   const [nextModel, setNextModel] = useState(model)
   const option = providerOptions.find((p) => p.id === nextProvider) ?? providerOptions.find((p) => p.label.toLowerCase() === nextProvider.toLowerCase())
-  return <div className="model-route"><div><span className="eyebrow">{capability}</span><strong>{model}</strong></div><select value={option?.id ?? nextProvider} onChange={(event) => setNextProvider(event.target.value)}>{providerOptions.map((option) => <option key={option.id} value={option.id}>{option.label}{option.kind === 'cloud' ? ' (cloud)' : ''}</option>)}</select><input value={nextModel} onChange={(event) => setNextModel(event.target.value)} /><button className="quiet-button" onClick={() => void onSave(capability, nextProvider, nextModel)}>Save</button></div>
+  const providerId = option?.id ?? nextProvider
+  const downloadable = providerId === 'ollama' || (providerId === 'local' && capability === 'transcription')
+  return <div className="model-route"><div><span className="eyebrow">{capability}</span><strong>{model}</strong></div><select value={providerId} onChange={(event) => setNextProvider(event.target.value)}>{providerOptions.map((option) => <option key={option.id} value={option.id}>{option.label}{option.kind === 'cloud' ? ' (cloud)' : ''}</option>)}</select><input value={nextModel} onChange={(event) => setNextModel(event.target.value)} placeholder="model name" /><button className="quiet-button" onClick={() => void onSave(capability, nextProvider, nextModel)}>Save</button>{downloadable && <button className="quiet-button" title={providerId === 'ollama' ? 'Pull model into Ollama' : 'Download weights into the Hugging Face cache'} onClick={() => void onDownload(capability, nextProvider, nextModel)}>Download</button>}</div>
 }
 
 function AssistantComposer({ workspace, onClose }: { workspace: Workspace; onClose: () => void }) {
@@ -433,6 +592,11 @@ function AssistantComposer({ workspace, onClose }: { workspace: Workspace; onClo
   const [working, setWorking] = useState(false)
   const [listening, setListening] = useState(false)
   const [language, setLanguage] = useState<AssistantLanguage>('en')
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape' && !working) onClose() }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose, working])
   const ask = async () => { if (!prompt.trim()) return; setWorking(true); try { const result = await askAssistant(workspace.id, prompt); const sources = result.citations.map((citation) => `- ${citation.title}${citation.uri ? ` (${citation.uri})` : ''}`).join('\n'); setResponse(result.response + (sources ? `\n\nSources\n${sources}` : '')) } catch (error) { setResponse(errMsg(error)) } finally { setWorking(false) } }
   const speak = () => { if (response && 'speechSynthesis' in window) { const utterance = new SpeechSynthesisUtterance(response); utterance.lang = languageSpeechCodes[language]; window.speechSynthesis.speak(utterance) } }
   const listen = async () => {
@@ -460,7 +624,7 @@ function AssistantComposer({ workspace, onClose }: { workspace: Workspace; onClo
       try { await startVoiceCapture(language); setListening(true) } catch (error) { setResponse(errMsg(error)) }
     }
   }
-  return <div className="modal-backdrop" onClick={onClose}><section className="composer" onClick={(event) => event.stopPropagation()}><div className="composer-orb">✦</div><span className="eyebrow">Neural assistant · {workspace.name}</span><h2>What should I take care of?</h2><textarea autoFocus value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask about a meeting, search your knowledge, or plan a task..." onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) void ask() }} />{response && <div className="assistant-response">{response}</div>}<div className="composer-footer"><span>{working ? 'Thinking locally...' : listening ? 'Listening...' : '⌘ Enter to send'}</span><div><select className="lang-select" value={language} onChange={(event) => setLanguage(event.target.value as AssistantLanguage)}><option value="en">EN</option><option value="hi">हि</option><option value="te">తె</option></select><button className="quiet-button" onClick={() => void listen()}>{listening ? 'Stop' : 'Voice'}</button><button className="quiet-button" disabled={!response} onClick={speak}>Speak</button><button className="quiet-button" onClick={onClose}>Close</button><button className="primary-button" disabled={working} onClick={() => void ask()}>Ask Neural</button></div></div></section></div>
+  return <div className="modal-backdrop"><section className="composer" role="dialog" aria-modal="true" aria-labelledby="assistant-dialog-title"><div className="composer-orb" aria-hidden="true">✦</div><span className="eyebrow">Neural assistant · {workspace.name}</span><h2 id="assistant-dialog-title">What should I take care of?</h2><textarea autoFocus value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask about a meeting, search your knowledge, or plan a task..." onKeyDown={(event) => { if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) void ask() }} />{response && <div className="assistant-response" role="status" aria-live="polite">{response}</div>}<div className="composer-footer"><span>{working ? 'Thinking locally...' : listening ? 'Listening...' : '⌘ Enter to send'}</span><div><select className="lang-select" value={language} onChange={(event) => setLanguage(event.target.value as AssistantLanguage)}><option value="en">EN</option><option value="hi">हि</option><option value="te">తె</option></select><button className="quiet-button" onClick={() => void listen()}>{listening ? 'Stop' : 'Voice'}</button><button className="quiet-button" disabled={!response} onClick={speak}>Speak</button><button className="quiet-button" onClick={onClose}>Close</button><button className="primary-button" disabled={working} onClick={() => void ask()}>Ask Neural</button></div></div></section></div>
 }
 
 function Calendar({ workspace }: { workspace: Workspace }) {
@@ -477,21 +641,25 @@ function Calendar({ workspace }: { workspace: Workspace }) {
   const [inviteEmail, setInviteEmail] = useState('')
   const [conflicts, setConflicts] = useState<ConflictInfo[]>([])
   const [participantEvent, setParticipantEvent] = useState('')
-  useEffect(() => { void Promise.all([listCalendarEvents(workspace.id), listCalendarConnections(workspace.id)]).then(([loadedEvents, loadedConnections]) => { setEvents(loadedEvents); setConnections(loadedConnections) }).catch(() => { setEvents([]); setConnections([]) }) }, [workspace.id])
-  const reload = async () => { setEvents(await listCalendarEvents(workspace.id)); setConnections(await listCalendarConnections(workspace.id)) }
+  useEffect(() => { void Promise.all([listCalendarEvents(workspace.id), listCalendarConnections(workspace.id), listReminders(workspace.id)]).then(([loadedEvents, loadedConnections, loadedReminders]) => { setEvents(loadedEvents); setConnections(loadedConnections); setEventReminders(loadedReminders.filter((r) => r.calendar_event_id)) }).catch(() => { setEvents([]); setConnections([]) }) }, [workspace.id])
+  const [eventReminders, setEventReminders] = useState<Reminder[]>([])
+  const loadReminders = async () => { try { const all = await listReminders(workspace.id); setEventReminders(all.filter((r) => r.calendar_event_id)) } catch { setEventReminders([]) } }
+  const reload = async () => { setEvents(await listCalendarEvents(workspace.id)); setConnections(await listCalendarConnections(workspace.id)); void loadReminders() }
   const resetForm = () => { setEditingId(''); setTitle(''); setStartsAt(''); setEndsAt(''); setRecurrence('') }
   const create = async () => { if (!title || !startsAt || !endsAt) return setMessage('Add a title and both event times.'); try { if (editingId) { await updateCalendarEvent(editingId, title, new Date(startsAt).toISOString(), new Date(endsAt).toISOString(), undefined, recurrence || undefined); setMessage('Event updated.') } else { await createCalendarEvent(workspace.id, title, new Date(startsAt).toISOString(), new Date(endsAt).toISOString(), undefined, recurrence || undefined); setMessage('Event saved to the local calendar.') } resetForm(); await reload() } catch (error) { setMessage(errMsg(error)) } }
   const edit = (event: CalendarEvent) => { setEditingId(event.id); setTitle(event.title); setStartsAt(event.starts_at.slice(0, 16)); setEndsAt(event.ends_at.slice(0, 16)); setRecurrence(event.recurrence ?? '') }
-  const remove = async (event: CalendarEvent) => { if (!await nativeConfirm(`Delete ${event.title}?`)) return; try { await deleteCalendarEvent(event.id); setEvents((current) => current.filter((item) => item.id !== event.id)); setMessage('Calendar event deleted.') } catch (error) { setMessage(errMsg(error)) } }
+  const remove = async (event: CalendarEvent) => { if (!await nativeConfirm(`Delete ${event.title}?`)) return; try { await deleteCalendarEvent(event.id); setEvents((current) => current.filter((item) => item.id !== event.id)); setExpanded((cur) => { const next = { ...cur }; delete next[event.id]; return next }); setMessage('Calendar event deleted.') } catch (error) { setMessage(errMsg(error)) } }
   const checkConflicts = async (event: CalendarEvent) => { try { setConflicts(await checkConflictsForEvent(workspace.id, event.id)) } catch (error) { setMessage(errMsg(error)) } }
-  const remindEvent = async (event: CalendarEvent) => { try { const reminder = await scheduleEventReminder(workspace.id, event.id, `Prep for ${event.title}`, new Date(event.starts_at).toISOString()); setMessage(`Reminder "${reminder.title}" scheduled for ${new Date(reminder.scheduled_at).toLocaleString()}.`) } catch (error) { setMessage(errMsg(error)) } }
+  const remindEvent = async (event: CalendarEvent) => { try { const reminder = await scheduleEventReminder(workspace.id, event.id, `Prep for ${event.title}`, new Date(event.starts_at).toISOString()); setMessage(`Reminder "${reminder.title}" scheduled for ${new Date(reminder.scheduled_at).toLocaleString()}.`); void loadReminders() } catch (error) { setMessage(errMsg(error)) } }
+  const cancelEventReminder = async (r: Reminder) => { try { await cancelReminder(r.id); setEventReminders((cur) => cur.map((x) => x.id === r.id ? { ...x, status: 'cancelled' } : x)) } catch (error) { setMessage(errMsg(error)) } }
+  const deleteEventReminder = async (r: Reminder) => { if (!await nativeConfirm('Delete this event reminder permanently?')) return; try { await deleteReminder(r.id); setEventReminders((cur) => cur.filter((x) => x.id !== r.id)) } catch (error) { setMessage(errMsg(error)) } }
   const toggleParticipants = async (event: CalendarEvent) => { if (expanded[event.id]) { setExpanded((cur) => { const next = { ...cur }; delete next[event.id]; return next }); return } try { const list = await listParticipants(event.id); setExpanded((cur) => ({ ...cur, [event.id]: list })); setParticipantEvent(event.id) } catch (error) { setMessage(errMsg(error)) } }
   const addInvitee = async (eventId: string) => { if (!inviteName.trim()) return setMessage('Enter a participant name.'); try { await addParticipant(eventId, inviteName.trim(), inviteEmail.trim() || undefined); setInviteName(''); setInviteEmail(''); setExpanded((cur) => ({ ...cur, [eventId]: [...(cur[eventId] ?? []), { id: 'tmp', event_id: eventId, name: inviteName.trim(), email: inviteEmail.trim() || undefined, status: 'invited' }] })); setMessage('Participant added. Use the ✉ button to send an invitation.') } catch (error) { setMessage(errMsg(error)) } }
   const invite = async (eventId: string, participantId: string) => { try { const result = await sendCalendarInvitation(eventId, participantId); setMessage(`Invitation sent to ${result.sent_to}.`) } catch (error) { setMessage(errMsg(error)) } }
   const connect = async (provider: 'google' | 'outlook') => { try { const connection = await connectCalendarProvider(workspace.id, provider, provider === 'google' ? 'Google Calendar' : 'Microsoft Outlook'); setConnections((current) => [...current.filter((item) => item.provider !== provider), connection]); try { const oauth = await generateOAuthUrl(provider); window.open(oauth.url, '_blank'); setMessage(`Authorize ${provider === 'google' ? 'Google' : 'Outlook'} in the opened browser window. After authorization, return here and click Sync to pull events.`) } catch { setMessage(`${provider === 'google' ? 'Google' : 'Outlook'} connection created. Set OAuth credentials in environment to authorize.`) } } catch (error) { setMessage(errMsg(error)) } }
   const syncConnection = async (connection: CalendarConnection) => { setMessage(`Syncing ${connection.provider} calendar...`); try { const result = await syncCalendarEvents(connection.id); await reload(); setMessage(result) } catch (error) { setMessage(errMsg(error)) } }
   const pullRemote = async (connection: CalendarConnection) => { setMessage(`Pulling ${connection.provider} calendar...`); try { const result = await pullRemoteCalendar(connection.id); const [created, updated, conflictCount] = result; await reload(); setMessage(`Pulled: ${created} new, ${updated} updated, ${conflictCount} conflicts`) } catch (error) { setMessage(errMsg(error)) } }
-  return <section className="calendar-section"><div className="calendar-header"><div><span className="eyebrow accent">Local calendar</span><h2>Make time for<br /><em>what matters.</em></h2><p>This built-in calendar is the source of truth for local events. Create, edit, invite participants, and sync bidirectionally with Google and Outlook.</p></div><div className="calendar-glyph">▦</div></div><div className="calendar-create"><span className="eyebrow">{editingId ? 'Edit event' : 'New event'}</span><div className="calendar-form"><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Event title" /><input type="datetime-local" value={startsAt} onChange={(event) => setStartsAt(event.target.value)} /><input type="datetime-local" value={endsAt} onChange={(event) => setEndsAt(event.target.value)} /><input value={recurrence} onChange={(event) => setRecurrence(event.target.value)} placeholder="Recurrence: 1 week | FREQ=WEEKLY" /><button className="primary-button" onClick={() => void create()}>{editingId ? 'Update event' : 'Add event'}</button>{editingId && <button className="quiet-button" onClick={resetForm}>Cancel edit</button>}</div>{message && <span className="ingestion-message">{message}</span>}</div><div className="calendar-create"><span className="eyebrow">External calendars</span><div className="calendar-connections"><button className="quiet-button" onClick={() => void connect('google')}>+ Connect Google Calendar</button><button className="quiet-button" onClick={() => void connect('outlook')}>+ Connect Outlook</button>{connections.map((connection) => <span key={connection.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span className="pill pill-local">{connection.provider} · {connection.status}</span><button className="quiet-button" onClick={() => void syncConnection(connection)}>Push</button><button className="quiet-button" onClick={() => void pullRemote(connection)}>Pull</button></span>)}</div></div>{conflicts.length > 0 && <div className="ingestion-panel"><span className="eyebrow">Conflicts detected</span>{conflicts.map((c) => <div key={`${c.event_id}-${c.overlapping_event_id}`} style={{ fontSize: '11px', padding: '6px 0', color: 'var(--soft)' }}>⚠ <strong>{c.title}</strong> overlaps with <strong>{c.overlapping_title}</strong> ({new Date(c.overlapping_starts_at).toLocaleString()})</div>)}</div>}<div className="event-list">{events.length === 0 ? <div className="empty-list">No local events yet.</div> : events.map((event) => <article className="event-item" key={event.id}><time>{new Date(event.starts_at).toLocaleString()}</time><div><strong>{event.title}</strong><span>{new Date(event.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.ends_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{event.recurrence && <span className="pill pill-local" style={{ marginLeft: '6px' }}>{event.recurrence}</span>}</div><div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}><button className="quiet-button" onClick={() => void edit(event)}>Edit</button><button className="quiet-button" onClick={() => void checkConflicts(event)}>Conflicts</button><button className="quiet-button" onClick={() => void remindEvent(event)} title="Schedule a reminder before this event">Remind</button><button className="quiet-button" onClick={() => void toggleParticipants(event)}>People</button><button className="quiet-button" onClick={() => void remove(event)}>Delete</button><span className="pill pill-local">{event.provider}</span></div>{expanded[event.id] && <div className="participant-panel" style={{ marginTop: '8px', padding: '10px', borderTop: '1px solid var(--line)' }}><div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}><input value={inviteName} onChange={(e) => setInviteName(e.target.value)} placeholder="Name" style={{ width: '110px', border: '1px solid var(--line)', borderRadius: '5px', padding: '6px', background: '#10131a', color: 'var(--soft)', fontSize: '10px' }} /><input value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} placeholder="email" style={{ width: '160px', border: '1px solid var(--line)', borderRadius: '5px', padding: '6px', background: '#10131a', color: 'var(--soft)', fontSize: '10px' }} /><button className="quiet-button" onClick={() => void addInvitee(event.id)}>Add</button></div>{(expanded[event.id] ?? []).map((p) => <div key={p.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '4px 0', fontSize: '11px' }}><span>{p.name}</span><span style={{ color: 'var(--muted)' }}>{p.email ?? ''}</span><span className="pill pill-local">{p.status}</span>{p.id !== 'tmp' && <button className="quiet-button" title="Send invitation" onClick={() => void invite(event.id, p.id)}>✉</button>}</div>)}</div>}</article>)}</div></section>
+  return <section className="calendar-section"><div className="calendar-header"><div><span className="eyebrow accent">Local calendar</span><h2>Make time for<br /><em>what matters.</em></h2><p>This built-in calendar is the source of truth for local events. Create, edit, invite participants, and sync bidirectionally with Google and Outlook.</p></div><div className="calendar-glyph">▦</div></div><div className="calendar-create"><span className="eyebrow">{editingId ? 'Edit event' : 'New event'}</span><div className="calendar-form"><input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Event title" /><input type="datetime-local" value={startsAt} onChange={(event) => setStartsAt(event.target.value)} /><input type="datetime-local" value={endsAt} onChange={(event) => setEndsAt(event.target.value)} /><input value={recurrence} onChange={(event) => setRecurrence(event.target.value)} placeholder="Recurrence: 1 week | FREQ=WEEKLY" /><button className="primary-button" onClick={() => void create()}>{editingId ? 'Update event' : 'Add event'}</button>{editingId && <button className="quiet-button" onClick={resetForm}>Cancel edit</button>}</div>{message && <span className="ingestion-message">{message}</span>}</div><div className="calendar-create"><span className="eyebrow">External calendars</span><div className="calendar-connections"><button className="quiet-button" onClick={() => void connect('google')}>+ Connect Google Calendar</button><button className="quiet-button" onClick={() => void connect('outlook')}>+ Connect Outlook</button>{connections.map((connection) => <span key={connection.id} style={{ display: 'flex', alignItems: 'center', gap: '8px' }}><span className="pill pill-local">{connection.provider} · {connection.status}</span><button className="quiet-button" onClick={() => void syncConnection(connection)}>Push</button><button className="quiet-button" onClick={() => void pullRemote(connection)}>Pull</button></span>)}</div></div>{conflicts.length > 0 && <div className="ingestion-panel"><span className="eyebrow">Conflicts detected</span>{conflicts.map((c) => <div key={`${c.event_id}-${c.overlapping_event_id}`} style={{ fontSize: '11px', padding: '6px 0', color: 'var(--soft)' }}>⚠ <strong>{c.title}</strong> overlaps with <strong>{c.overlapping_title}</strong> ({new Date(c.overlapping_starts_at).toLocaleString()})</div>)}</div>}{eventReminders.length > 0 && <div className="ingestion-panel"><span className="eyebrow">Event reminders</span>{eventReminders.map((r) => <div key={r.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', fontSize: '11px', padding: '4px 0' }}><span style={{ flex: 1 }}><strong style={{ display: 'block' }}>{r.title}</strong><small style={{ color: 'var(--muted)' }}>{new Date(r.scheduled_at).toLocaleString()} · {r.status}</small></span>{r.status === 'scheduled' && <button className="quiet-button" onClick={() => void cancelEventReminder(r)}>Cancel</button>}<button className="quiet-button" onClick={() => void deleteEventReminder(r)} title="Delete reminder">✕</button></div>)}</div>}<div className="event-list">{events.length === 0 ? <div className="empty-list">No local events yet.</div> : events.map((event) => <article className="event-item" key={event.id}><time>{new Date(event.starts_at).toLocaleString()}</time><div><strong>{event.title}</strong><span>{new Date(event.starts_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} - {new Date(event.ends_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>{event.recurrence && <span className="pill pill-local" style={{ marginLeft: '6px' }}>{event.recurrence}</span>}</div><div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}><button className="quiet-button" onClick={() => void edit(event)}>Edit</button><button className="quiet-button" onClick={() => void checkConflicts(event)}>Conflicts</button><button className="quiet-button" onClick={() => void remindEvent(event)} title="Schedule a reminder before this event">Remind</button><button className="quiet-button" onClick={() => void toggleParticipants(event)}>People</button><button className="quiet-button" onClick={() => void remove(event)}>Delete</button><span className="pill pill-local">{event.provider}</span></div>{expanded[event.id] && <div className="participant-panel" style={{ marginTop: '8px', padding: '10px', borderTop: '1px solid var(--line)' }}><div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}><input value={inviteName} onChange={(e) => setInviteName(e.target.value)} placeholder="Name" style={{ width: '110px', border: '1px solid var(--line)', borderRadius: '5px', padding: '6px', background: '#10131a', color: 'var(--soft)', fontSize: '10px' }} /><input value={inviteEmail} onChange={(e) => setInviteEmail(e.target.value)} placeholder="email" style={{ width: '160px', border: '1px solid var(--line)', borderRadius: '5px', padding: '6px', background: '#10131a', color: 'var(--soft)', fontSize: '10px' }} /><button className="quiet-button" onClick={() => void addInvitee(event.id)}>Add</button></div>{(expanded[event.id] ?? []).map((p) => <div key={p.id} style={{ display: 'flex', gap: '8px', alignItems: 'center', padding: '4px 0', fontSize: '11px' }}><span>{p.name}</span><span style={{ color: 'var(--muted)' }}>{p.email ?? ''}</span><span className="pill pill-local">{p.status}</span>{p.id !== 'tmp' && <button className="quiet-button" title="Send invitation" onClick={() => void invite(event.id, p.id)}>✉</button>}</div>)}</div>}</article>)}</div></section>
 }
 
 function Mail({ workspace }: { workspace: Workspace }) {
@@ -512,10 +680,11 @@ function Mail({ workspace }: { workspace: Workspace }) {
   useEffect(() => { void listEmails(workspace.id).then(setEmails).catch(() => setEmails([])) }, [workspace.id])
   const addAccount = async () => { if (!label.trim()) return setMessage('Add an account label or email address.'); try { const account = await connectEmailAccount(workspace.id, provider, label.trim(), imapHost || undefined, smtpHost || undefined); setAccounts((current) => [...current.filter((item) => item.provider !== provider), account]); setMessage(`${provider === 'imap' ? 'IMAP/SMTP' : provider} account saved locally and awaiting authorization.`) } catch (error) { setMessage(errMsg(error)) } }
   const sync = async (account: EmailAccount) => { setMessage(`Syncing ${account.account_label}...`); try { const result = account.provider === 'imap' ? await syncEmailAccount(account.id) : await syncEmailOAuth(account.id); setAccounts((current) => current.map((item) => item.id === account.id ? { ...item, status: 'synced' } : item)); setEmails(await listEmails(workspace.id)); setMessage(`${result.stored} new message${result.stored === 1 ? '' : 's'} stored from ${result.fetched} fetched (${account.provider === 'imap' ? 'IMAP' : 'OAuth'}).`) } catch (error) { setMessage(errMsg(error)) } }
-  const search = async () => { setEmails(await listEmails(workspace.id, query)) }
+  const [semantic, setSemantic] = useState(false)
+  const search = async () => { try { setEmails(semantic ? await semanticSearchEmails(workspace.id, query) : await listEmails(workspace.id, query)) } catch (error) { setMessage(errMsg(error)) } }
   const [triage, setTriage] = useState<TriageItem[]>([])
   const runTriage = async () => { setMessage('Reviewing recent inbox...'); try { const items = await emailTriage(workspace.id); setTriage(items); setMessage(items.length ? `${items.length} message${items.length === 1 ? '' : 's'} flagged for triage.` : 'No recent messages to triage.') } catch (error) { setMessage(errMsg(error)) } }
-  const generateDraft = async () => { if (!subject.trim()) return setMessage('Add a subject to generate a draft from.'); setMessage('Generating draft...'); try { const draft = await generateEmailDraft(workspace.id, `Write an email with subject: ${subject}`, to ? `To: ${to}` : 'General email', 'qwen3:14b'); setBody(draft); setMessage('Draft generated. Review and edit before sending.') } catch (error) { setMessage(errMsg(error)) } }
+  const generateDraft = async () => { if (!subject.trim()) return setMessage('Add a subject to generate a draft from.'); setMessage('Generating draft...'); try { const draft = await generateEmailDraft(workspace.id, `Write an email with subject: ${subject}`, to ? `To: ${to}` : 'General email', DEFAULT_LMSTUDIO_MODEL); setBody(draft); setMessage('Draft generated. Review and edit before sending.') } catch (error) { setMessage(errMsg(error)) } }
   const compose = async () => {
     if (!to.trim() || !subject.trim() || !selectedAccount) return setMessage('Recipient, subject, and an account are required.')
     setMessage('Sending...')
@@ -525,7 +694,7 @@ function Mail({ workspace }: { workspace: Workspace }) {
       if (result.sent) { setComposing(false); setTo(''); setSubject(''); setBody('') }
     } catch (error) { setMessage(errMsg(error)) }
   }
-  return <section className="mail-section"><div className="mail-header"><div><span className="eyebrow accent">Private inbox</span><h2>Your attention,<br /><em>well directed.</em></h2><p>Mail stays connected to the selected workspace. Gmail, Outlook, and generic IMAP/SMTP accounts share one local model.</p></div><div className="mail-glyph">✉</div></div><div className="mail-create"><span className="eyebrow">Add account</span><div className="mail-form"><select value={provider} onChange={(event) => setProvider(event.target.value as typeof provider)}><option value="gmail">Gmail</option><option value="outlook">Outlook / Microsoft 365</option><option value="imap">Generic IMAP / SMTP</option></select><input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="you@example.com" />{provider === 'imap' && <><input value={imapHost} onChange={(event) => setImapHost(event.target.value)} placeholder="IMAP host" /><input value={smtpHost} onChange={(event) => setSmtpHost(event.target.value)} placeholder="SMTP host" /></>}<button className="primary-button" onClick={() => void addAccount()}>Add account</button></div>{message && !composing && <span className="ingestion-message">{message}</span>}</div><div className="account-list">{accounts.length === 0 ? <div className="empty-list">No mail accounts connected to this workspace.</div> : accounts.map((account) => <article className="account-item" key={account.id}><span className="activity-icon violet">✉</span><div><strong>{account.account_label}</strong><span>{account.provider}{account.imap_host ? ` · ${account.imap_host}` : ''}</span></div><button className="quiet-button" onClick={() => void sync(account)}>Sync ↗</button><span className="pill pill-local">{account.status}</span></article>)}</div>{!composing && <button className="primary-button" style={{ marginTop: '15px' }} onClick={() => { setComposing(true); setSelectedAccount(accounts[0]?.id ?? '') }}>+ Compose email</button>}{composing && <div className="ingestion-panel"><span className="eyebrow">New message</span><div className="compose-form"><select value={selectedAccount} onChange={(event) => setSelectedAccount(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{account.account_label}</option>)}</select><input value={to} onChange={(event) => setTo(event.target.value)} placeholder="To" /><input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Subject" /><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write your message..." /><div style={{ display: 'flex', gap: '9px' }}><button className="primary-button" onClick={() => void compose()}>Send</button><button className="quiet-button" onClick={() => void generateDraft()}>✨ Draft</button><button className="quiet-button" onClick={() => { setComposing(false); setMessage('') }}>Cancel</button></div></div>{message && <span className="ingestion-message">{message}</span>}</div>}<div className="mailbox"><div className="mailbox-search"><span className="eyebrow">Local mailbox</span><div><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search subject, sender, or body" onKeyDown={(event) => { if (event.key === 'Enter') void search() }} /><button className="primary-button" onClick={() => void search()}>Search</button><button className="quiet-button" onClick={() => void runTriage()}>Triage inbox ↗</button></div></div>{triage.length > 0 && <div className="triage-list" style={{ margin: '12px 0' }}><span className="eyebrow">Triage suggestions</span>{triage.map((item) => <div key={item.email_id} style={{ display: 'flex', gap: '10px', padding: '6px 0', borderBottom: '1px solid var(--line)', fontSize: '11px', alignItems: 'center' }}><span className="pill pill-local" style={{ flexShrink: 0 }}>{item.reason}</span><div style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.subject}</strong><span style={{ color: 'var(--muted)' }}>{item.sender}</span></div></div>)}</div>}{emails.length === 0 ? <div className="empty-list">No synchronized messages in this workspace.</div> : emails.map((email) => <article className="email-item" key={email.id}><div><strong>{email.subject}</strong><span>{email.sender ?? 'Unknown sender'}</span><p>{email.body?.slice(0, 180) ?? ''}</p></div><time>{email.received_at ? new Date(email.received_at).toLocaleDateString() : '—'}</time><button className="quiet-button" title="Extract action items" onClick={() => { void extractEmailActions(email.id).then((tasks) => { setMessage(`${tasks.length} action item${tasks.length === 1 ? '' : 's'} extracted.`); if (tasks.length === 0) setMessage('No action items found in this email.') }).catch((error) => setMessage(errMsg(error))) }}>⚡</button></article>)}</div></section>
+  return <section className="mail-section"><div className="mail-header"><div><span className="eyebrow accent">Private inbox</span><h2>Your attention,<br /><em>well directed.</em></h2><p>Mail stays connected to the selected workspace. Gmail, Outlook, and generic IMAP/SMTP accounts share one local model.</p></div><div className="mail-glyph">✉</div></div><div className="mail-create"><span className="eyebrow">Add account</span><div className="mail-form"><select value={provider} onChange={(event) => setProvider(event.target.value as typeof provider)}><option value="gmail">Gmail</option><option value="outlook">Outlook / Microsoft 365</option><option value="imap">Generic IMAP / SMTP</option></select><input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="you@example.com" />{provider === 'imap' && <><input value={imapHost} onChange={(event) => setImapHost(event.target.value)} placeholder="IMAP host" /><input value={smtpHost} onChange={(event) => setSmtpHost(event.target.value)} placeholder="SMTP host" /></>}<button className="primary-button" onClick={() => void addAccount()}>Add account</button></div>{message && !composing && <span className="ingestion-message">{message}</span>}</div><div className="account-list">{accounts.length === 0 ? <div className="empty-list">No mail accounts connected to this workspace.</div> : accounts.map((account) => <article className="account-item" key={account.id}><span className="activity-icon violet">✉</span><div><strong>{account.account_label}</strong><span>{account.provider}{account.imap_host ? ` · ${account.imap_host}` : ''}</span></div><button className="quiet-button" onClick={() => void sync(account)}>Sync ↗</button><span className="pill pill-local">{account.status}</span></article>)}</div>{!composing && <button className="primary-button" style={{ marginTop: '15px' }} onClick={() => { setComposing(true); setSelectedAccount(accounts[0]?.id ?? '') }}>+ Compose email</button>}{composing && <div className="ingestion-panel"><span className="eyebrow">New message</span><div className="compose-form"><select value={selectedAccount} onChange={(event) => setSelectedAccount(event.target.value)}>{accounts.map((account) => <option key={account.id} value={account.id}>{account.account_label}</option>)}</select><input value={to} onChange={(event) => setTo(event.target.value)} placeholder="To" /><input value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Subject" /><textarea value={body} onChange={(event) => setBody(event.target.value)} placeholder="Write your message..." /><div style={{ display: 'flex', gap: '9px' }}><button className="primary-button" onClick={() => void compose()}>Send</button><button className="quiet-button" onClick={() => void generateDraft()}>✨ Draft</button><button className="quiet-button" onClick={() => { setComposing(false); setMessage('') }}>Cancel</button></div></div>{message && <span className="ingestion-message">{message}</span>}</div>}<div className="mailbox"><div className="mailbox-search"><span className="eyebrow">Local mailbox</span><div><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search subject, sender, or body" onKeyDown={(event) => { if (event.key === 'Enter') void search() }} /><button className="primary-button" onClick={() => void search()}>Search</button><button className="quiet-button" onClick={() => { setSemantic((s) => !s); if (query) void search() }}>{semantic ? 'Semantic ✓' : 'Semantic'}</button><button className="quiet-button" onClick={() => void runTriage()}>Triage inbox ↗</button></div></div>{triage.length > 0 && <div className="triage-list" style={{ margin: '12px 0' }}><span className="eyebrow">Triage suggestions</span>{triage.map((item) => <div key={item.email_id} style={{ display: 'flex', gap: '10px', padding: '6px 0', borderBottom: '1px solid var(--line)', fontSize: '11px', alignItems: 'center' }}><span className="pill pill-local" style={{ flexShrink: 0 }}>{item.reason}</span><div style={{ flex: 1, minWidth: 0 }}><strong style={{ display: 'block', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{item.subject}</strong><span style={{ color: 'var(--muted)' }}>{item.sender}</span></div></div>)}</div>}{emails.length === 0 ? <div className="empty-list">No synchronized messages in this workspace.</div> : emails.map((email) => <article className="email-item" key={email.id}><div><strong>{email.subject}</strong><span>{email.sender ?? 'Unknown sender'}</span><p>{email.body?.slice(0, 180) ?? ''}</p></div><time>{email.received_at ? new Date(email.received_at).toLocaleDateString() : '—'}</time><button className="quiet-button" title="Extract action items" onClick={() => { void extractEmailActions(email.id).then((tasks) => { setMessage(`${tasks.length} action item${tasks.length === 1 ? '' : 's'} extracted.`); if (tasks.length === 0) setMessage('No action items found in this email.') }).catch((error) => setMessage(errMsg(error))) }}>⚡</button></article>)}</div></section>
 }
 
 // ── Diagnostics View ───────────────────────────────────────────────────────
@@ -534,6 +703,7 @@ function DiagnosticsView({ workspace }: { workspace: Workspace }) {
   const [stats, setStats] = useState<StorageStats | null>(null)
   const [health, setHealth] = useState<ProviderHealth[]>([])
   const [sync, setSync] = useState<SyncStatus[]>([])
+  const [audit, setAudit] = useState<AuditEntry[]>([])
   const [deletion, setDeletion] = useState<FullDeletionPreview | null>(null)
   const [message, setMessage] = useState('')
   const [apiKeys, setApiKeys] = useState<string[]>([])
@@ -543,10 +713,15 @@ function DiagnosticsView({ workspace }: { workspace: Workspace }) {
   useEffect(() => { void getStorageStats().then(setStats).catch(() => setStats(null)) }, [])
   useEffect(() => { void getProviderHealth(workspace.id).then(setHealth).catch(() => setHealth([])) }, [workspace.id])
   useEffect(() => { void getSyncStatus(workspace.id).then(setSync).catch(() => setSync([])) }, [workspace.id])
+  useEffect(() => { void getAuditLog(workspace.id, 100).then(setAudit).catch(() => setAudit([])) }, [workspace.id])
   useEffect(() => { void listApiKeys().then(setApiKeys).catch(() => setApiKeys([])) }, [])
   const createKey = async () => { if (!keyLabel.trim()) return setMessage('Enter a label for this API key.'); try { const key = await generateApiKey(keyLabel.trim()); setNewKey(key); setApiKeys(await listApiKeys()); setKeyLabel(''); setMessage('API key generated. Copy it now — it is only shown once.') } catch (e) { setMessage(String(e)) } }
   const revokeKey = async (label: string) => { try { await revokeApiKey(label); setApiKeys(await listApiKeys()); setMessage(`API key "${label}" revoked.`) } catch (e) { setMessage(String(e)) } }
   const saveRetention = async () => { try { await setWorkspaceRetention(workspace.id, parseInt(retentionDays)); setMessage(`Recording retention for ${workspace.name} set to ${retentionDays} days.`) } catch (e) { setMessage(String(e)) } }
+  const [logLines, setLogLines] = useState('')
+  const [logFile, setLogFile] = useState('')
+  const refreshLog = async () => { try { setLogLines(await readAppLog(300)); setLogFile(await appLogPath()) } catch { setLogLines('(log unavailable)') } }
+  useEffect(() => { void refreshLog() }, [])
 
   return <section className="diagnostics-section">
     <div className="empty-section task-intro"><span className="eyebrow accent">System diagnostics</span><h2>Everything<br /><em>under control.</em></h2><p>Monitor storage, provider health, and sync status. Preview deletion impact before removing data.</p></div>
@@ -562,6 +737,11 @@ function DiagnosticsView({ workspace }: { workspace: Workspace }) {
     <div className="model-list" style={{ marginTop: '18px' }}>
       {sync.map((s) => <div className="model-route" key={s.provider}><div><strong>{s.provider}</strong><span style={{ color: 'var(--muted)', fontSize: '10px' }}>{s.last_sync ? `Last: ${new Date(s.last_sync).toLocaleString()}` : 'Never synced'}</span></div><span style={{ display: 'flex', gap: '6px' }}><span className="pill pill-local">{s.synced} done</span>{s.pending > 0 && <span className="pill pill-cloud">{s.pending} pending</span>}{s.conflicts > 0 && <span className="pill pill-cloud">{s.conflicts} conflicts</span>}{s.failed > 0 && <span className="pill pill-cloud">{s.failed} failed</span>}</span></div>)}
       {sync.length === 0 && <div className="empty-list">No sync providers connected.</div>}
+    </div>
+    <div className="ingestion-panel" style={{ marginTop: '18px' }}>
+      <span className="eyebrow">Audit log</span>
+      <p style={{ fontSize: '11px', color: 'var(--muted)', margin: '4px 0 8px' }}>Cloud egress, recording, permission, sync, and deletion events for this workspace.</p>
+      {audit.length === 0 ? <div className="empty-list">No audit events yet.</div> : <div style={{ display: 'grid', gap: '5px', maxHeight: '220px', overflow: 'auto' }}>{audit.map((entry) => <div key={entry.id} style={{ borderBottom: '1px solid var(--line)', padding: '5px 0', fontSize: '10px' }}><strong>{entry.action}</strong><span style={{ color: 'var(--muted)', marginLeft: '8px' }}>{new Date(entry.timestamp).toLocaleString()}</span><span style={{ display: 'block', color: 'var(--soft)', marginTop: '2px' }}>{entry.details}</span>{(entry.provider || entry.data_type) && <small style={{ color: 'var(--muted)' }}>{entry.provider ?? ''}{entry.data_type ? ` · ${entry.data_type}` : ''}</small>}</div>)}</div>}
     </div>
     <div className="ingestion-panel" style={{ marginTop: '18px' }}>
       <span className="eyebrow">Deletion impact preview</span>
@@ -597,6 +777,16 @@ function DiagnosticsView({ workspace }: { workspace: Workspace }) {
       {deletion?.meetings.map((m) => <div key={m.meeting_id} style={{ display: 'flex', gap: '6px', alignItems: 'center', padding: '4px 0', fontSize: '11px', flexWrap: 'wrap' }}><strong>{m.meeting_title}</strong>{m.transcript_segments > 0 && <button className="quiet-button" onClick={() => { void deleteTranscriptSegments(m.meeting_id).then(() => setMessage(`Transcript removed (${m.meeting_id}).`)).catch((e) => setMessage(String(e))) }}>Delete transcript</button>}{m.summary_exists && <button className="quiet-button" onClick={() => { void deleteMeetingSummary(m.meeting_id).then(() => setMessage('Summary removed.')).catch((e) => setMessage(String(e))) }}>Delete summary</button>}{m.actions > 0 && <button className="quiet-button" onClick={() => { void deleteMeetingActions(m.meeting_id).then(() => setMessage('Action items removed.')).catch((e) => setMessage(String(e))) }}>Delete actions</button>}{m.recording_path && <button className="quiet-button" onClick={() => { void deleteMeetingRecording(m.meeting_id).then(() => setMessage('Recording file removed.')).catch((e) => setMessage(String(e))) }}>Delete recording</button>}</div>)}
       {(!deletion || deletion.meetings.length === 0) && <span className="empty-list">Load the deletion preview above to manage meeting-derived data.</span>}
     </div>
+    <div className="ingestion-panel" style={{ marginTop: '18px' }}>
+      <span className="eyebrow">Application log</span>
+      <h3>neural-agent-os.log</h3>
+      <p style={{ fontSize: '11px', color: 'var(--muted)', margin: '4px 0 10px' }}>{logFile || 'Log file…'} — every job, transcription, model download, and error is written here (last 300 lines).</p>
+      <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+        <button className="quiet-button" onClick={() => void refreshLog()}>Refresh</button>
+        <button className="quiet-button" onClick={() => { void navigator.clipboard?.writeText(logLines) }}>Copy</button>
+      </div>
+      <pre style={{ whiteSpace: 'pre-wrap', fontSize: '10px', lineHeight: 1.5, maxHeight: '360px', overflow: 'auto', border: '1px solid var(--line)', borderRadius: '8px', padding: '10px', color: 'var(--soft)' }}>{logLines || 'No log lines yet.'}</pre>
+    </div>
   </section>
 }
 
@@ -624,7 +814,7 @@ function ThreadsView({ workspace }: { workspace: Workspace }) {
   const [message, setMessage] = useState('')
   const load = async () => { try { setThreads(await rebuildThreads(workspace.id)) } catch (e) { setMessage(String(e)) } }
   useEffect(() => { void load() }, [workspace.id])
-  const summarize = async (thread: EmailThread) => { setMessage('Summarizing thread...'); try { const result = await summarizeEmailThread(thread.thread_id, workspace.id, 'qwen3:14b'); setSummary(result); setMessage('Thread summarized.') } catch (e) { setMessage(String(e)) } }
+  const summarize = async (thread: EmailThread) => { setMessage('Summarizing thread...'); try { const result = await summarizeEmailThread(thread.thread_id, workspace.id, DEFAULT_LMSTUDIO_MODEL); setSummary(result); setMessage('Thread summarized.') } catch (e) { setMessage(String(e)) } }
   return <section className="sources-section">
     <div className="empty-section source-intro"><span className="eyebrow accent">Email threads</span><h2>Conversations,<br /><em>rebuilt.</em></h2><p>Threads are reconstructed by grouping emails with the same cleaned subject line. Click refresh to rebuild.</p><button className="primary-button" onClick={() => void load()} style={{ marginTop: '12px' }}>Refresh threads</button>{message && <span className="ingestion-message">{message}</span>}{summary && <div className="summary-panel" style={{ marginTop: '12px' }}><span className="eyebrow">Thread summary</span><div>{summary}</div></div>}</div>
     <div className="source-panel">
@@ -644,6 +834,293 @@ function ThreeDView({ workspace }: { workspace: Workspace }) {
   const [prompt, setPrompt] = useState('')
   const [response, setResponse] = useState('')
   const [working, setWorking] = useState(false)
+  const [voiceMode, setVoiceMode] = useState(false)
+  const [voiceStatus, setVoiceStatus] = useState('')
+
+  const stateRef = useRef(state)
+  const voiceModeRef = useRef(false)
+  const voiceInputRef = useRef<'native' | 'browser' | null>(null)
+  const browserRecRef = useRef<BrowserRecognition | null>(null)
+  const pollRef = useRef<number | null>(null)
+  const silenceCountRef = useRef(0)
+  const noFileMsRef = useRef(0)
+  const streamTTSRef = useRef({ buf: '', last: 0, pending: 0 })
+  useEffect(() => { stateRef.current = state }, [state])
+
+  // ── Speech output: native TTS in the desktop app, browser TTS elsewhere ──
+  const speakReply = (text: string) =>
+    new Promise<void>((resolve) => {
+      const s = streamTTSRef.current
+      s.pending += 1
+      let done = false
+      const finish = () => { if (!done) { done = true; s.pending -= 1; resolve() } }
+      const inTauri = '__TAURI_INTERNALS__' in window
+      if (inTauri) {
+        // Native engine (macOS say / espeak-ng / SAPI) — BLOCKS until the
+        // speech has finished, so the mic never re-opens mid-reply.
+        void localTextToSpeech(text, 'en').then(() => finish()).catch(() => finish())
+        setTimeout(finish, Math.min(20000, 900 + text.length * 65)) // hard safety net
+      } else if ('speechSynthesis' in window) {
+        try {
+          const u = new SpeechSynthesisUtterance(text)
+          u.rate = 1.05
+          u.pitch = 1.1
+          u.onend = finish
+          u.onerror = finish
+          window.speechSynthesis.cancel()
+          window.speechSynthesis.speak(u)
+          setTimeout(finish, Math.min(12000, 900 + text.length * 65)) // safety
+          return
+        } catch { finish() }
+        setTimeout(finish, 3000)
+      } else {
+        setTimeout(finish, 3000)
+      }
+    })
+
+  // ── Speech input: native mic (desktop), Web Speech API (browser dev) ──
+  const stopPolling = () => {
+    if (pollRef.current !== null) { window.clearInterval(pollRef.current); pollRef.current = null }
+    silenceCountRef.current = 0
+    noFileMsRef.current = 0
+  }
+
+  // Hands-free auto-answer: poll the recording every 400ms; once the user has
+  // spoken and then gone ~2s silent, end the turn automatically (no tap).
+  const startPolling = () => {
+    stopPolling()
+    pollRef.current = window.setInterval(() => {
+      if (!voiceModeRef.current || voiceInputRef.current !== 'native') return stopPolling()
+      void checkVoiceSilence()
+        .then((status) => {
+          if (!status.has_capture) return stopPolling()
+          if (!status.file_exists) {
+            noFileMsRef.current += 400
+            if (noFileMsRef.current > 3500) {
+              setResponse('Microphone is not producing audio — check microphone permissions.')
+              void toggleVoiceMode(false)
+            }
+            return
+          }
+          if (!status.has_speech) return // wait until the user starts speaking
+          if (status.duration_secs < 0.6) return // ignore blips/background noise
+          silenceCountRef.current = status.trailing_rms < 0.01 ? silenceCountRef.current + 1 : 0
+          if (silenceCountRef.current >= 5) { // ~2.0-2.4s of silence after speech
+            silenceCountRef.current = 0
+            void endTurn()
+          }
+        })
+        .catch(() => { /* transient poll error — keep listening */ })
+    }, 400)
+  }
+
+  const beginListening = async () => {
+    // never open the mic while Ava is still speaking (prevents echo loops)
+    if (streamTTSRef.current.pending > 0) {
+      setTimeout(() => { if (voiceModeRef.current && streamTTSRef.current.pending <= 0) void beginListening() }, 350)
+      return
+    }
+    setState('listening')
+    setVoiceStatus('Listening… talk, then I answer when you pause (~2s)')
+    try {
+      await startVoiceCapture('en')
+      voiceInputRef.current = 'native'
+      startPolling()
+      return
+    } catch (nativeError) {
+      // Desktop capture unavailable (e.g. running the web build) — try the
+      // browser's Web Speech API before giving up.
+      const win = window as unknown as {
+        SpeechRecognition?: new () => BrowserRecognition
+        webkitSpeechRecognition?: new () => BrowserRecognition
+      }
+      const SR = win.SpeechRecognition || win.webkitSpeechRecognition
+      if (!SR) throw nativeError
+      voiceInputRef.current = 'browser'
+      if (!browserRecRef.current) {
+        const rec = new SR()
+        rec.lang = 'en-US'
+        rec.interimResults = false
+        rec.continuous = false
+        rec.onresult = (ev) => {
+          let text = ''
+          for (let i = 0; i < ev.results.length; i++) {
+            const alt = ev.results[i][0]
+            if (alt) text += alt.transcript
+          }
+          if (text.trim()) {
+            rec.stop()
+            void handleUserText(text.trim())
+          }
+        }
+        rec.onend = () => {
+          // keep the hands-free loop alive while we are simply listening
+          if (voiceModeRef.current && stateRef.current === 'listening' && streamTTSRef.current.pending <= 0) {
+            setTimeout(() => { if (voiceModeRef.current && stateRef.current === 'listening') void beginListening() }, 400)
+          }
+        }
+        rec.onerror = (ev) => {
+          if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
+            setResponse('Voice access was denied — allow the microphone permission and try again.')
+            void toggleVoiceMode(false)
+          }
+        }
+        browserRecRef.current = rec
+      }
+      try { browserRecRef.current.start() } catch { /* already running */ }
+    }
+  }
+
+  const stopListening = async () => {
+    stopPolling()
+    if (voiceInputRef.current === 'native') {
+      try { await stopVoiceCapture() } catch { /* no active capture */ }
+    }
+    if (browserRecRef.current) { try { browserRecRef.current.stop() } catch { /* noop */ } }
+    voiceInputRef.current = null
+  }
+
+  // ── End the user's turn: stop the mic, then process what was said ──
+  const endTurn = async () => {
+    stopPolling()
+    if (voiceInputRef.current !== 'native') return
+    setState('thinking')
+    setVoiceStatus('Transcribing…')
+    try {
+      const text = await stopVoiceCapture()
+      if (text.trim()) await handleUserText(text.trim())
+      else if (voiceModeRef.current) await beginListening()
+    } catch (error) {
+      setResponse(errMsg(error))
+      if (voiceModeRef.current) await beginListening()
+      else { setState('idle'); setVoiceStatus('') }
+    }
+  }
+
+  // ── Incremental TTS: speak streamed tokens as they arrive ──
+  const speakDelta = (delta: string) => {
+    const s = streamTTSRef.current
+    s.buf += delta
+    const now = Date.now()
+    const words = s.buf.trim() ? s.buf.trim().split(/\s+/).length : 0
+    if (/[.!?\n]/.test(delta) || (words >= 4 && now - s.last > 450)) {
+      const chunk = s.buf
+      s.buf = ''
+      s.last = now
+      if (chunk.trim()) {
+        s.pending += 1
+        if ('speechSynthesis' in window) {
+          try {
+            const u = new SpeechSynthesisUtterance(chunk)
+            u.rate = 1.05
+            u.pitch = 1.1
+            const doneChunk = () => { s.pending -= 1 }
+            u.onend = doneChunk
+            u.onerror = doneChunk
+            window.speechSynthesis.speak(u)
+            setTimeout(doneChunk, Math.min(6000, 400 + chunk.length * 60)) // safety
+            return
+          } catch { s.pending -= 1 }
+        }
+        void localTextToSpeech(chunk, 'en').catch(() => { s.pending -= 1 })
+        setTimeout(() => { s.pending -= 1 }, Math.min(6000, 300 + chunk.length * 55))
+      }
+    }
+  }
+  const flushStreamTTS = () => {
+    if (streamTTSRef.current.buf.trim()) speakDelta('\n')
+  }
+  const waitForSpeech = (ms = 15000) =>
+    new Promise<void>((resolve) => {
+      const t0 = Date.now()
+      const tick = () => {
+        if (streamTTSRef.current.pending <= 0 || Date.now() - t0 > ms) resolve()
+        else setTimeout(tick, 200)
+      }
+      tick()
+    })
+
+  // ── One user utterance → assistant → spoken reply → re-listen ──
+  const handleUserText = async (text: string) => {
+    setState('speaking')
+    setVoiceStatus('Speaking…')
+    streamTTSRef.current = { buf: '', last: 0, pending: 0 }
+    try {
+      // Fast path: streamed reply — start talking while the model writes.
+      let full = ''
+      await streamVoiceReply(text, VOICE_LMSTUDIO_MODEL, (token) => {
+        full += token
+        setResponse(full)
+        speakDelta(token)
+      })
+      flushStreamTTS()
+      setResponse(full.trim())
+      await waitForSpeech()
+    } catch {
+      // Fallback: whole-reply path (works even without a streaming backend).
+      const result = await askAssistant(workspace.id, text)
+      setResponse(result.response)
+      await speakReply(result.response)
+    }
+    if (voiceModeRef.current) {
+      await new Promise((resolve) => setTimeout(resolve, 650)) // let room echo decay
+      await beginListening()
+    } else {
+      setState('idle')
+      setVoiceStatus('')
+    }
+  }
+
+  // ── Voice mode on/off ──
+  const toggleVoiceMode = async (force?: boolean) => {
+    const next = force ?? !voiceModeRef.current
+    voiceModeRef.current = next
+    setVoiceMode(next)
+    if (next) {
+      setState('speaking')
+      setVoiceStatus('Voice mode on…')
+      try {
+        await speakReply('Voice mode on! Go ahead, I am listening.')
+        await new Promise((resolve) => setTimeout(resolve, 650)) // room echo decay
+        await beginListening()
+      } catch (error) {
+        setResponse(errMsg(error))
+        voiceModeRef.current = false
+        setVoiceMode(false)
+        setState('idle')
+        setVoiceStatus('')
+      }
+    } else {
+      await stopListening()
+      stopPolling()
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+      setState('idle')
+      setVoiceStatus('')
+    }
+  }
+
+  // Cleanup when leaving the view
+  useEffect(() => () => {
+    voiceModeRef.current = false
+    stopPolling()
+    void stopVoiceCapture().catch(() => {})
+    if (browserRecRef.current) { try { browserRecRef.current.stop() } catch { /* noop */ } }
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel()
+  }, [])
+
+  // Push-to-talk (non voice-mode): click avatar to start/stop the mic.
+  const toggleVoice = async (next: 'idle' | 'listening') => {
+    if (next === 'listening') {
+      setState('listening')
+      try { await startVoiceCapture('en') } catch (error) { setState('idle'); setResponse(errMsg(error)) }
+    } else {
+      setState('idle')
+      try {
+        const text = await stopVoiceCapture()
+        if (text.trim()) setPrompt((current) => (current ? current + ' ' : '') + text.trim())
+      } catch (error) { setResponse(errMsg(error)) }
+    }
+  }
 
   const ask = async () => {
     if (!prompt.trim()) return
@@ -668,29 +1145,39 @@ function ThreeDView({ workspace }: { workspace: Workspace }) {
     }
   }
 
+  // Avatar click: in voice mode, a tap = "I'm done talking". Otherwise the
+  // classic push-to-talk toggle.
+  const onAvatarClick = () => {
+    if (voiceModeRef.current) {
+      if (stateRef.current === 'listening') void endTurn()
+      return
+    }
+    void toggleVoice(state === 'idle' ? 'listening' : 'idle')
+  }
+
   return (
     <section className="three-d-section">
       <div className="three-d-hero">
         <div>
           <span className="eyebrow accent">3D Assistant</span>
           <h2>Your companion,<br /><em>visualized.</em></h2>
-          <p>The 3D character responds to assistant state — idle, listening, speaking, and thinking. Click it to toggle voice input, or use the chat below.</p>
+          <p>A human-proportioned avatar responds to assistant state — idle, listening, speaking, and thinking. Turn on <b>Voice mode</b> for a hands-free conversation, or use the chat below.</p>
         </div>
-        <ThreeDAssistant state={state} size={220} onStateChange={(s) => s === 'idle' ? setState('listening') : setState('idle')} />
+        <div className="three-d-canvas"><HumanAvatar state={state} size={240} speech={state === 'speaking' ? response : undefined} onStateChange={() => onAvatarClick()} /></div>
       </div>
       <div className="ingestion-panel">
         <span className="eyebrow">Chat with the assistant</span>
         <div className="ingestion-form">
           <input value={prompt} onChange={(e) => setPrompt(e.target.value)} placeholder="Ask about your knowledge base..." onKeyDown={(e) => { if (e.key === 'Enter') void ask() }} />
           <button className="primary-button" disabled={working} onClick={() => void ask()}>{working ? 'Thinking...' : 'Ask'}</button>
+          <button className={`primary-button voice-toggle${voiceMode ? ' on' : ''}`} onClick={() => void toggleVoiceMode()}>{voiceMode ? '⏹ Voice mode' : '🎙️ Voice mode'}</button>
         </div>
+        {voiceStatus && <span className="ingestion-message voice-status">{voiceStatus}</span>}
         {response && <div className="assistant-response">{response}</div>}
       </div>
     </section>
   )
-}
-
-// ── Cost Limits View ───────────────────────────────────────────────────────
+}// ── Cost Limits View ───────────────────────────────────────────────────────
 
 function CostsView({ workspace }: { workspace: Workspace }) {
   const [summary, setSummary] = useState<CostSummary | null>(null)

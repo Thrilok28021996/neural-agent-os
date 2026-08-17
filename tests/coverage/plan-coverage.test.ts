@@ -293,14 +293,14 @@ describe('Branch hardening (defaults/fallbacks)', () => {
   it('extractEmailActions applies default workspace and model when omitted', async () => {
     const { extractEmailActions } = await import('../../src/data/automation')
     await extractEmailActions('e1')
-    expect(invoke).toHaveBeenCalledWith('extract_email_actions', { emailId: 'e1', workspaceId: 'personal', model: 'qwen3:14b' })
+    expect(invoke).toHaveBeenCalledWith('extract_email_actions', { emailId: 'e1', workspaceId: 'personal', model: 'qwen/qwen3.5-9b' })
   })
 
   it('generateEmailDraft applies the default local model when omitted', async () => {
     const { generateEmailDraft } = await import('../../src/data/emailComplete')
     await generateEmailDraft('w1', 'Draft a reply', 'context')
     expect(invoke).toHaveBeenCalledWith('generate_email_draft', {
-      workspaceId: 'w1', instructions: 'Draft a reply', context: 'context', model: 'qwen3:14b',
+      workspaceId: 'w1', instructions: 'Draft a reply', context: 'context', model: 'qwen/qwen3.5-9b',
     })
   })
 

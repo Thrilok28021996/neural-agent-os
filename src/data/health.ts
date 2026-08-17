@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type ProviderHealth = { provider: string; capability: string; model: string; healthy: boolean; last_checked_at?: string; response_time_ms?: number; error_message?: string; consecutive_failures: number }
 

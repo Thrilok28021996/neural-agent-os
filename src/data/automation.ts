@@ -1,8 +1,9 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
+import { DEFAULT_LMSTUDIO_MODEL } from './providers'
 import type { Task } from './tasks'
 
 export function extractEmailActions(emailId: string, workspaceId?: string, model?: string) {
-  return invoke<string[]>('extract_email_actions', { emailId, workspaceId: workspaceId ?? 'personal', model: model ?? 'qwen3:14b' })
+  return invoke<string[]>('extract_email_actions', { emailId, workspaceId: workspaceId ?? 'personal', model: model ?? DEFAULT_LMSTUDIO_MODEL })
 }
 
 export function linkTranscriptToProfile(segmentId: string, profileId: string) {

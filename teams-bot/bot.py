@@ -8,25 +8,31 @@ Deployment: Docker container, runs locally or on a private server.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
+import struct
 import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote
 
 import aiohttp
 import aiofiles
-from cryptography.fernet import Fernet
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 # ── Configuration ──────────────────────────────────────────────────────────
 
 DATA_DIR = Path(os.environ.get("NEURAL_TEAMS_DATA_DIR", "/data"))
 RECORDINGS_DIR = DATA_DIR / "recordings"
 METADATA_DIR = DATA_DIR / "metadata"
-ENCRYPTION_KEY = os.environ.get("NEURAL_TEAMS_ENCRYPTION_KEY", Fernet.generate_key().decode())
+# Shared secret between the bot and the local app. One value drives both the
+# request auth (`X-Teams-Bot-Token` header) and the AES-256-GCM recording
+# encryption (key = SHA-256(secret)). Configure identically on both sides.
+SHARED_SECRET = os.environ.get("NAO_TEAMS_BOT_SECRET", "")
 NEURAL_API_URL = os.environ.get("NEURAL_API_URL", "http://host.docker.internal:8787")
 TEAMS_CLIENT_ID = os.environ.get("NEURAL_TEAMS_CLIENT_ID", "")
 TEAMS_CLIENT_SECRET = os.environ.get("NEURAL_TEAMS_CLIENT_SECRET", "")
@@ -37,14 +43,55 @@ POLL_INTERVAL = int(os.environ.get("NEURAL_TEAMS_POLL_INTERVAL", "60"))
 
 # ── State ──────────────────────────────────────────────────────────────────
 
+MAX_TRANSFER_ATTEMPTS = 5
+
+
+def derive_aes_key(secret: str) -> bytes:
+    """Derive the 32-byte AES-256 key from the shared secret (matches the Rust app)."""
+    return hashlib.sha256(secret.encode("utf-8")).digest()
+
+
+def encrypt_payload(aes_key: bytes, plaintext: bytes) -> bytes:
+    """Encrypt a recording for transfer: nonce(12) || AES-256-GCM ciphertext+tag.
+
+    Layout matches the Rust app (`teams_bot::decrypt_recording`).
+    """
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(aes_key)
+    return nonce + aesgcm.encrypt(nonce, plaintext, None)
+
+
+def make_silent_wav(seconds: float = 2.0, sample_rate: int = 16000) -> bytes:
+    """Build a minimal valid 16-bit mono PCM WAV of silence.
+
+    Used by the simulated capture so the local pipeline can be exercised
+    end-to-end. In production the Graph Communications API bot media SDK
+    writes real audio frames instead.
+    """
+    num_samples = int(seconds * sample_rate)
+    data_size = num_samples * 2  # 16-bit mono
+    header = struct.pack(
+        "<4sI4s4sIHHIIHH4sI",
+        b"RIFF", 36 + data_size, b"WAVE",
+        b"fmt ", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16,
+        b"data", data_size,
+    )
+    return header + b"\x00\x00" * num_samples
+
+
 class TeamsBot:
-    def __init__(self):
+    def __init__(self, shared_secret: Optional[str] = None):
         self.bot_id = str(uuid.uuid4())
-        self.fernet = Fernet(ENCRYPTION_KEY.encode() if isinstance(ENCRYPTION_KEY, str) else ENCRYPTION_KEY)
+        self.shared_secret = shared_secret if shared_secret is not None else SHARED_SECRET
+        self.aes_key = derive_aes_key(self.shared_secret) if self.shared_secret else None
         self.active_meetings: dict[str, dict] = {}
         self.running = True
         self.access_token: Optional[str] = None
         self.token_expiry: Optional[datetime] = None
+
+    def _auth_headers(self) -> dict[str, str]:
+        """Headers used for every request to the local app."""
+        return {"X-Teams-Bot-Token": self.shared_secret}
 
     async def report_status(self, status: str, message: str = "", meeting_id: Optional[str] = None):
         """Send status update to the local Neural Agent OS API."""
@@ -60,6 +107,7 @@ class TeamsBot:
                 async with session.post(
                     f"{NEURAL_API_URL}/teams-bot/status",
                     json=payload,
+                    headers=self._auth_headers(),
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status != 200:
@@ -110,6 +158,7 @@ class TeamsBot:
             async with aiohttp.ClientSession() as session:
                 async with session.get(
                     f"{NEURAL_API_URL}/teams-bot/meetings",
+                    headers=self._auth_headers(),
                     timeout=aiohttp.ClientTimeout(total=10),
                 ) as resp:
                     if resp.status == 200:
@@ -200,8 +249,14 @@ class TeamsBot:
         recording_path = Path(info["recording_path"])
         recording_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # In production: connect to Teams media stream via bot SDK
-        # and capture audio frames here.
+        # In production: connect to the Teams media stream via the Graph
+        # Communications API / bot media SDK and write real audio frames here.
+        # The stub below writes a short silent WAV so the join -> capture ->
+        # encrypt -> upload -> decrypt pipeline can run end-to-end locally.
+        simulated = make_silent_wav(seconds=2.0, sample_rate=16000)
+        async with aiofiles.open(recording_path, "wb") as f:
+            await f.write(simulated)
+
         await self.report_status(
             "recording",
             f"Audio capture active for {info['meeting'].get('title')}",
@@ -233,57 +288,121 @@ class TeamsBot:
         await self.report_status("left", f"Left meeting: {info['meeting'].get('title')}", meeting_id)
 
     async def transfer_recording(self, meeting_id: str) -> bool:
-        """Transfer encrypted recording to local Neural Agent OS."""
+        """Transfer the encrypted recording to the local Neural Agent OS app.
+
+        The meeting stays in `active_meetings` until the transfer succeeds, so
+        a failed upload can be retried on the next poll. After
+        MAX_TRANSFER_ATTEMPTS the state is dropped with a final failure report.
+        """
         info = self.active_meetings.get(meeting_id)
         if not info:
+            return False
+        if info.get("transfer_complete"):
+            return True
+        if info.get("transfer_attempts", 0) >= MAX_TRANSFER_ATTEMPTS:
+            self.active_meetings.pop(meeting_id, None)
+            await self.report_status("transfer_failed", "Max transfer attempts reached", meeting_id)
+            return False
+        if not self.aes_key:
+            self.active_meetings.pop(meeting_id, None)
+            await self.report_status("transfer_failed", "NAO_TEAMS_BOT_SECRET not configured", meeting_id)
             return False
 
         recording_path = Path(info["recording_path"])
         if not recording_path.exists():
+            self.active_meetings.pop(meeting_id, None)
             await self.report_status("transfer_failed", "Recording file not found", meeting_id)
             return False
 
         try:
-            # Encrypt recording data
+            # Encrypt recording data (nonce || AES-256-GCM ciphertext+tag)
             async with aiofiles.open(recording_path, "rb") as f:
                 plaintext = await f.read()
-            encrypted = self.fernet.encrypt(plaintext)
+            encrypted = encrypt_payload(self.aes_key, plaintext)
 
-            # Send to local API
+            title = info["meeting"].get("title", "Unknown")
+            url = (
+                f"{NEURAL_API_URL}/teams-bot/upload"
+                f"?meeting_id={quote(meeting_id)}&title={quote(title)}"
+            )
+            # Send to local API as a raw binary body (matches the Rust handler)
             async with aiohttp.ClientSession() as session:
-                form = aiohttp.FormData()
-                form.add_field("meeting_id", meeting_id)
-                form.add_field("title", info["meeting"].get("title", "Unknown"))
-                form.add_field("encrypted", "true")
-                form.add_field(
-                    "file",
-                    encrypted,
-                    filename=f"{meeting_id}.enc",
-                    content_type="application/octet-stream",
-                )
-
                 async with session.post(
-                    f"{NEURAL_API_URL}/teams-bot/upload",
-                    data=form,
+                    url,
+                    data=encrypted,
+                    headers={
+                        **self._auth_headers(),
+                        "Content-Type": "application/octet-stream",
+                    },
                     timeout=aiohttp.ClientTimeout(total=120),
                 ) as resp:
                     if resp.status == 200:
+                        info["transfer_complete"] = True
+                        info["status"] = "transferred"
+                        self.active_meetings[meeting_id] = info
                         await self.report_status("transfer_complete", "Recording transferred", meeting_id)
+                        self.active_meetings.pop(meeting_id, None)
                         return True
                     else:
                         body = await resp.text()
+                        info["transfer_attempts"] = info.get("transfer_attempts", 0) + 1
+                        self.active_meetings[meeting_id] = info
                         await self.report_status("transfer_failed", f"Upload error: {body[:200]}", meeting_id)
                         return False
         except Exception as e:
+            info["transfer_attempts"] = info.get("transfer_attempts", 0) + 1
+            self.active_meetings[meeting_id] = info
             await self.report_status("transfer_failed", str(e), meeting_id)
             return False
+
+    async def _poll_once(self, meetings: list):
+        """Process one poll of scheduled meetings (testable without the loop).
+
+        - Meetings already joined: once the window has passed (>5 min after
+          start), transfer the recording FIRST while the state still exists,
+          then leave. Failed transfers keep the state and retry on the next
+          poll (up to MAX_TRANSFER_ATTEMPTS).
+        - New meetings: join from 2 minutes before start until 5 minutes after.
+        """
+        for meeting in meetings:
+            meeting_id = meeting.get("id")
+            if not meeting_id:
+                continue
+            starts_at = meeting.get("starts_at", "")
+            if not starts_at:
+                continue
+            try:
+                start_time = datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
+                now = datetime.now(timezone.utc)
+                diff_seconds = (start_time - now).total_seconds()
+            except (ValueError, TypeError):
+                continue
+
+            if meeting_id in self.active_meetings:
+                if diff_seconds < -300:
+                    if await self.transfer_recording(meeting_id):
+                        await self.leave_meeting(meeting_id)
+                    else:
+                        await self.report_status(
+                            "transfer_pending",
+                            "Transfer failed; will retry on next poll",
+                            meeting_id,
+                        )
+                continue
+
+            if -120 <= diff_seconds <= 300:
+                if await self.join_meeting(meeting):
+                    await self.capture_audio(meeting_id)
 
     async def run(self):
         """Main bot loop."""
         await self.report_status("starting", "Teams bot initializing")
 
-        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-        METADATA_DIR.mkdir(parents=True, exist_ok=True)
+        for data_dir in (RECORDINGS_DIR, METADATA_DIR):
+            try:
+                data_dir.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                print(f"Warning: cannot create {data_dir}: {e}", file=sys.stderr)
 
         # Initial auth
         if not await self.authenticate():
@@ -295,42 +414,25 @@ class TeamsBot:
             try:
                 # Fetch meetings that need bot participation
                 meetings = await self.fetch_upcoming_meetings()
-
-                for meeting in meetings:
-                    meeting_id = meeting.get("id")
-                    if not meeting_id or meeting_id in self.active_meetings:
-                        continue
-
-                    # Check if meeting is happening now (±5 minutes)
-                    starts_at = meeting.get("starts_at", "")
-                    if starts_at:
-                        try:
-                            start_time = datetime.fromisoformat(starts_at.replace("Z", "+00:00"))
-                            now = datetime.now(timezone.utc)
-                            diff_seconds = (start_time - now).total_seconds()
-
-                            # Join 2 minutes before start, leave 5 minutes after scheduled end
-                            if -120 <= diff_seconds <= 300:
-                                if await self.join_meeting(meeting):
-                                    await self.capture_audio(meeting_id)
-                            elif diff_seconds < -300 and meeting_id in self.active_meetings:
-                                # Meeting is past its scheduled time
-                                await self.leave_meeting(meeting_id)
-                                # Transfer recording asynchronously
-                                asyncio.create_task(self.transfer_recording(meeting_id))
-                        except (ValueError, TypeError):
-                            pass
-
+                await self._poll_once(meetings)
                 await asyncio.sleep(POLL_INTERVAL)
             except Exception as e:
                 print(f"Bot loop error: {e}", file=sys.stderr)
                 await asyncio.sleep(POLL_INTERVAL)
 
     def shutdown(self):
-        """Graceful shutdown."""
+        """Graceful shutdown: hand off any active recordings, then leave."""
         self.running = False
         for meeting_id in list(self.active_meetings.keys()):
-            asyncio.ensure_future(self.leave_meeting(meeting_id))
+            asyncio.ensure_future(self._shutdown_meeting(meeting_id))
+
+    async def _shutdown_meeting(self, meeting_id: str):
+        """Best-effort final transfer before leaving; never blocks shutdown forever."""
+        try:
+            await asyncio.wait_for(self.transfer_recording(meeting_id), timeout=30)
+        except Exception:
+            pass
+        await self.leave_meeting(meeting_id)
 
 
 # ── Entrypoint ─────────────────────────────────────────────────────────────

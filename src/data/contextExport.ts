@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 /** Export a markdown bundle of a workspace's context for coding agents. */
 export function exportContext(workspaceId: string) {

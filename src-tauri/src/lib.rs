@@ -1,4 +1,5 @@
 mod cloud;
+pub mod logging;
 mod fallback;
 mod costs;
 mod reranking;
@@ -18,8 +19,12 @@ mod email_complete;
 mod health;
 mod plan_extras;
 mod chat;
+mod teams_bot;
+mod agent_tools;
+mod sidebar_selftest;
+pub use sidebar_selftest::run_sidebar_selftest;
 
-use tauri::Manager;
+use tauri::{Manager, Emitter};
 use rusqlite::{params, Connection};
 use walkdir::WalkDir;
 use quick_xml::events::Event;
@@ -33,21 +38,118 @@ use tauri_plugin_notification::NotificationExt;
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-fn database_path(app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
-    let default_directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
-    let marker = default_directory.join("data-directory.txt");
-    let directory = std::fs::read_to_string(&marker).ok().map(|path| std::path::PathBuf::from(path.trim())).filter(|path| path.is_dir()).unwrap_or(default_directory);
-    std::fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    Ok(directory.join("neural-agent-os.sqlite"))
+// ── Unified data layout ────────────────────────────────────────────────────
+// Everything Neural Agent OS creates or stores lives under ONE root folder:
+//   <root>/database/           SQLite database (+ WAL/SHM)
+//   <root>/logs/               application log (+ rotated .log.1)
+//   <root>/backups/            workspace backups
+//   <root>/recordings/         captured audio (default output path)
+//   <root>/transcripts/        whisper JSON/TXT outputs
+//   <root>/models/             Hugging Face model cache
+//   <root>/tmp/                transient voice-capture / intermediates
+//   <root>/teams-recordings/   Teams bot uploads
+// The root defaults to ~/Neural Agent OS and can be overridden with
+// NEURAL_DATA_DIR or the legacy data-directory.txt marker.
+static DATA_ROOT: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+pub(crate) fn set_data_root(root: std::path::PathBuf) {
+    if let Ok(mut slot) = DATA_ROOT.lock() { *slot = Some(root); }
+}
+
+pub(crate) fn data_root() -> std::path::PathBuf {
+    if let Ok(slot) = DATA_ROOT.lock() {
+        if let Some(root) = slot.as_ref() { return root.clone(); }
+    }
+    std::env::var("NEURAL_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join("Neural Agent OS"))
+}
+
+const DATA_SUBDIRS: &[&str] = &["database", "logs", "backups", "recordings", "transcripts", "models", "tmp", "teams-recordings"];
+
+/// Absolute path of a named subfolder under the data root (created on demand).
+pub(crate) fn data_subdir(name: &str) -> std::path::PathBuf {
+    let dir = data_root().join(name);
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Create the full folder tree under the data root.
+pub(crate) fn ensure_data_layout() {
+    let root = data_root();
+    let _ = std::fs::create_dir_all(&root);
+    for sub in DATA_SUBDIRS {
+        let _ = std::fs::create_dir_all(root.join(sub));
+    }
+}
+
+/// Move files written by older versions (flat app-data directory) into the
+/// unified layout. Runs once at startup, before the database is opened.
+fn migrate_legacy_layout(app: &tauri::AppHandle, root: &std::path::Path) {
+    let Ok(old) = app.path().app_data_dir() else { return };
+    if old == root { return; }
+    let move_file = |src: std::path::PathBuf, dst: std::path::PathBuf| {
+        if src.is_file() && !dst.exists() {
+            if std::fs::rename(&src, &dst).is_err() {
+                let _ = std::fs::copy(&src, &dst);
+                let _ = std::fs::remove_file(&src);
+            }
+            log::info!("data migration: {} -> {}", src.display(), dst.display());
+        }
+    };
+    move_file(old.join("neural-agent-os.sqlite"), root.join("database/neural-agent-os.sqlite"));
+    move_file(old.join("neural-agent-os.sqlite-wal"), root.join("database/neural-agent-os.sqlite-wal"));
+    move_file(old.join("neural-agent-os.sqlite-shm"), root.join("database/neural-agent-os.sqlite-shm"));
+    move_file(old.join("neural-agent-os.log"), root.join("logs/neural-agent-os.log"));
+    move_file(old.join("neural-agent-os.log.1"), root.join("logs/neural-agent-os.log.1"));
+    if let Ok(entries) = std::fs::read_dir(old.join("backups")) {
+        for entry in entries.flatten() {
+            move_file(entry.path(), root.join("backups").join(entry.file_name()));
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(old.join("teams-recordings")) {
+        for entry in entries.flatten() {
+            move_file(entry.path(), root.join("teams-recordings").join(entry.file_name()));
+        }
+    }
+}
+
+fn database_path(_app: &tauri::AppHandle) -> Result<std::path::PathBuf, String> {
+    Ok(data_subdir("database").join("neural-agent-os.sqlite"))
 }
 
 fn open_database(app: &tauri::AppHandle) -> Result<Connection, String> {
-    let connection = Connection::open(database_path(app)?).map_err(|error| error.to_string())?;
+    let path = database_path(app)?;
+    log::debug!("open_database: {}", path.display());
+    let connection = Connection::open(&path).map_err(|error| error.to_string())?;
     init_schema(&connection)?;
+    // Backfill the creation timestamp for databases created before this
+    // column existed; retention uses it when imported meetings lack started_at.
+    let _ = connection.execute("ALTER TABLE meetings ADD COLUMN created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP", []);
+    let _ = connection.execute("ALTER TABLE meetings ADD COLUMN language TEXT NOT NULL DEFAULT 'en'", []);
+    let _ = connection.execute("ALTER TABLE transcription_jobs ADD COLUMN language TEXT", []);
+    let _ = connection.execute("ALTER TABLE transcript_segments ADD COLUMN speaker_confidence REAL", []);
+    let _ = connection.execute("UPDATE meetings SET created_at = COALESCE(created_at, started_at, CURRENT_TIMESTAMP) WHERE created_at IS NULL", []);
 connection.execute(
         "INSERT OR IGNORE INTO workspaces (id, name, source_count) VALUES (?1, ?2, ?3), (?4, ?5, ?6), (?7, ?8, ?9)",
         params!["personal", "Personal", 8, "neural-os", "Neural Agent OS", 12, "research", "Research", 5],
     ).map_err(|error| error.to_string())?;
+    // Default model routing: LM Studio is the default provider for chat,
+    // summarization, and embeddings (override per workspace in the Models
+    // view; existing explicit routes are left untouched). The model ids are
+    // configurable via NEURAL_OPENAI_COMPATIBLE_MODEL and
+    // NEURAL_OPENAI_COMPATIBLE_EMBEDDING_MODEL.
+    let chat_model = default_lmstudio_model();
+    let embed_model = default_lmstudio_embedding_model();
+    for (capability, model) in [("chat", &chat_model), ("summarization", &chat_model), ("embeddings", &embed_model)] {
+        connection.execute(
+            "INSERT OR IGNORE INTO model_routes (workspace_id, capability, provider, model)
+             SELECT id, ?1, 'lmstudio', ?2 FROM workspaces",
+            params![capability, model],
+        ).map_err(|error| error.to_string())?;
+    }
     Ok(connection)
 }
 
@@ -73,13 +175,46 @@ fn resolve_output_path_inner(home: &str, data_dir: &std::path::Path, path: &str)
     }
 }
 
-fn resolve_output_path(app: &tauri::AppHandle, path: &str) -> Result<std::path::PathBuf, String> {
+fn resolve_output_path(_app: &tauri::AppHandle, path: &str) -> Result<std::path::PathBuf, String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    let data_dir = database_path(app)?
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(std::env::temp_dir);
-    resolve_output_path_inner(&home, &data_dir, path)
+    // Relative/~ paths resolve inside the unified data root so everything the
+    // app writes stays in one folder.
+    resolve_output_path_inner(&home, &data_root(), path)
+}
+
+/// Locate an external binary. macOS GUI apps launched from Finder have a
+/// minimal PATH (/usr/bin:/bin:...), so Homebrew-installed tools like FFmpeg
+/// or Whisper would otherwise be "not found". Checks the explicit env var,
+/// well-known install locations, then PATH.
+pub(crate) fn resolve_binary(name: &str, env_var: &str) -> Result<String, String> {
+    if let Ok(path) = std::env::var(env_var) {
+        if !path.trim().is_empty() {
+            return Ok(path.trim().to_string());
+        }
+    }
+    let candidates = [
+        format!("/opt/homebrew/bin/{name}"),
+        format!("/usr/local/bin/{name}"),
+        format!("/opt/local/bin/{name}"),
+        format!("/usr/bin/{name}"),
+        format!("/bin/{name}"),
+    ];
+    for candidate in candidates {
+        if std::path::Path::new(&candidate).is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Ok(path) = std::env::var("PATH") {
+        for dir in path.split(':') {
+            let candidate = format!("{dir}/{name}");
+            if std::path::Path::new(&candidate).is_file() {
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(format!(
+        "{name} not found. Install it (e.g. `brew install ffmpeg` / `pip install openai-whisper`) or set {env_var}."
+    ))
 }
 
 pub(crate) fn init_schema(connection: &Connection) -> Result<(), String> {
@@ -163,13 +298,16 @@ pub(crate) fn init_schema(connection: &Connection) -> Result<(), String> {
            started_at TEXT,
            duration_seconds INTEGER,
            recording_path TEXT,
-           status TEXT NOT NULL DEFAULT 'created'
+           status TEXT NOT NULL DEFAULT 'created',
+           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+           language TEXT NOT NULL DEFAULT 'en'
          );
          CREATE TABLE IF NOT EXISTS transcription_jobs (
            id TEXT PRIMARY KEY NOT NULL,
            meeting_id TEXT NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,
            provider TEXT NOT NULL DEFAULT 'unconfigured',
            status TEXT NOT NULL DEFAULT 'queued',
+           language TEXT,
            error TEXT,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
@@ -195,7 +333,8 @@ pub(crate) fn init_schema(connection: &Connection) -> Result<(), String> {
            start_seconds REAL NOT NULL,
            end_seconds REAL NOT NULL,
            text TEXT NOT NULL,
-           confidence REAL
+           confidence REAL,
+           speaker_confidence REAL
          );
          CREATE TABLE IF NOT EXISTS tasks (
            id TEXT PRIMARY KEY NOT NULL,
@@ -227,7 +366,8 @@ pub(crate) fn init_schema(connection: &Connection) -> Result<(), String> {
            provider TEXT NOT NULL DEFAULT 'local',
            external_id TEXT,
            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-           updated_at TEXT
+           updated_at TEXT,
+           recording_auto_started TEXT
          );
          CREATE TABLE IF NOT EXISTS calendar_connections (
            id TEXT PRIMARY KEY NOT NULL,
@@ -484,6 +624,7 @@ pub(crate) fn init_schema(connection: &Connection) -> Result<(), String> {
     let _ = connection.execute("ALTER TABLE sources ADD COLUMN content_hash TEXT", []);
     let _ = connection.execute("ALTER TABLE sources ADD COLUMN indexed_at TEXT", []);
     let _ = connection.execute("ALTER TABLE calendar_events ADD COLUMN updated_at TEXT", []);
+    let _ = connection.execute("ALTER TABLE calendar_events ADD COLUMN recording_auto_started TEXT", []);
 
     // Register the clean_subject SQL function used by email thread reconstruction.
     connection.create_scalar_function(
@@ -544,8 +685,8 @@ pub(crate) fn routed_model(connection: &Connection, workspace_id: &str, capabili
     // In offline mode or low-latency, force local fallback
     if offline_only || prefer_local {
         return match capability {
-            "chat" | "summarization" => "qwen3:14b".to_string(),
-            "embeddings" => "nomic-embed-text".to_string(),
+            "chat" | "summarization" => default_lmstudio_model(),
+            "embeddings" => default_lmstudio_embedding_model(),
             "transcription" => "whisper-large-v3".to_string(),
             _ => fallback.to_string(),
         };
@@ -627,6 +768,7 @@ struct TranscriptSegmentRecord {
     end_seconds: f64,
     text: String,
     confidence: Option<f64>,
+    speaker_confidence: Option<f64>,
 }
 
 #[derive(serde::Serialize)]
@@ -791,11 +933,22 @@ struct WorkspaceDeletionPreview {
 
 struct Recorder {
     child: Child,
+    /// Pipe used to send ffmpeg the "q" command for a graceful stop, so the
+    /// container (moov atom in m4a) is finalized and the file stays decodable.
+    stdin: Option<std::process::ChildStdin>,
+    stderr: Option<std::process::ChildStderr>,
     path: std::path::PathBuf,
     workspace_id: String,
     title: String,
+    /// Calendar event that auto-started this recording (auto-stop tracking).
+    event_id: Option<String>,
+    /// RFC3339 end of the calendar event; the scheduler stops the recording
+    /// shortly after this time when auto-started.
+    auto_stop_at: Option<String>,
 }
-struct RecorderState(Mutex<Option<Recorder>>);
+/// Shared recorder process. A static (not tauri-managed) so the Tauri command
+/// and the loopback REST API can start/stop the same capture.
+static RECORDER: Mutex<Option<Recorder>> = Mutex::new(None);
 
 /// Push-to-talk voice input: FFmpeg mic capture + local Whisper transcription.
 struct VoiceCapture {
@@ -805,6 +958,67 @@ struct VoiceCapture {
 }
 struct VoiceCaptureState(Mutex<Option<VoiceCapture>>);
 
+fn terminate_capture_child(mut child: Child) -> Result<(), String> {
+    match child.kill() {
+        Ok(()) => {}
+        Err(error) => {
+            // The process may already have exited; only report an error if it
+            // is still running and therefore could still hold the microphone.
+            if child.try_wait().map_err(|probe| probe.to_string())?.is_none() {
+                return Err(error.to_string());
+            }
+        }
+    }
+    child.wait().map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Stop child capture processes when the application exits. Child processes do
+/// not automatically terminate when the Tauri process is closed, so leaving
+/// them alive would keep the microphone open after the UI disappears.
+fn cleanup_capture_processes(app: &tauri::AppHandle) {
+    let mut stopped_recording: Option<(String, String)> = None;
+    if let Ok(mut active) = RECORDER.lock() {
+        if let Some(recorder) = active.take() {
+            let path = recorder.path.to_string_lossy().into_owned();
+            let workspace_id = recorder.workspace_id.clone();
+            if let Err(error) = terminate_capture_child(recorder.child) {
+                log::warn!("application_exit: failed to stop recording capture (workspace={workspace_id}, path={path}): {error}");
+            }
+            stopped_recording = Some((workspace_id, path));
+        }
+    } else {
+        log::error!("application_exit: recorder state lock unavailable; capture may remain active");
+    }
+
+    if let Some(state) = app.try_state::<VoiceCaptureState>() {
+        if let Ok(mut active) = state.0.lock() {
+            if let Some(capture) = active.take() {
+                let path = capture.path.to_string_lossy().into_owned();
+                if let Err(error) = terminate_capture_child(capture.child) {
+                    log::warn!("application_exit: failed to stop voice capture (path={path}): {error}");
+                }
+                log::info!("application_exit: stopped voice capture (path={path})");
+            }
+        } else {
+            log::error!("application_exit: voice capture state lock unavailable; capture may remain active");
+        }
+    }
+
+    if let Some((workspace_id, path)) = stopped_recording {
+        log::warn!("application_exit: stopped active recording (workspace={workspace_id}, path={path})");
+        if let Ok(connection) = open_database(app) {
+            let _ = retention::record_audit(
+                &connection,
+                "recording_stopped_on_exit",
+                None,
+                Some("audio"),
+                Some(&workspace_id),
+                &format!("Capture process stopped during application exit: {path}"),
+            );
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 struct RecordingStatus {
     active: bool,
@@ -813,21 +1027,70 @@ struct RecordingStatus {
     queued: bool,
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Workspace export/restore format (#8).
+///
+/// v2 adds:
+/// - `schema_version` + `content_hash` (SHA-256 over the canonical payload)
+///   so tampered/truncated backups are rejected on import and by
+///   `verify_backup`;
+/// - `row_counts` per domain for restore verification;
+/// - full domain coverage (notes, calendar, memories, source chunks, model
+///   routes, permissions, web pages, email accounts, jobs, bot runs, speaker
+///   embeddings, agent runs).
+/// New fields default so legacy v1 exports still import.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct WorkspaceExport {
     version: u32,
+    #[serde(default)]
+    schema_version: u32,
     exported_at: String,
     workspace_id: String,
+    #[serde(default)]
+    content_hash: String,
+    #[serde(default)]
+    row_counts: std::collections::HashMap<String, usize>,
     workspaces: Vec<serde_json::Value>,
     sources: Vec<serde_json::Value>,
+    #[serde(default)]
+    source_chunks: Vec<serde_json::Value>,
     meetings: Vec<serde_json::Value>,
     transcript_segments: Vec<serde_json::Value>,
+    #[serde(default)]
+    meeting_summaries: Vec<serde_json::Value>,
+    #[serde(default)]
+    meeting_actions: Vec<serde_json::Value>,
+    #[serde(default)]
+    transcription_jobs: Vec<serde_json::Value>,
     tasks: Vec<serde_json::Value>,
     reminders: Vec<serde_json::Value>,
     emails: Vec<serde_json::Value>,
+    #[serde(default)]
+    email_accounts: Vec<serde_json::Value>,
     embeddings: Vec<serde_json::Value>,
     voice_profiles: Vec<serde_json::Value>,
+    #[serde(default)]
+    speaker_embeddings: Vec<serde_json::Value>,
     agents: Vec<serde_json::Value>,
+    #[serde(default)]
+    agent_runs: Vec<serde_json::Value>,
+    #[serde(default)]
+    notes: Vec<serde_json::Value>,
+    #[serde(default)]
+    calendar_events: Vec<serde_json::Value>,
+    #[serde(default)]
+    calendar_participants: Vec<serde_json::Value>,
+    #[serde(default)]
+    model_routes: Vec<serde_json::Value>,
+    #[serde(default)]
+    memories: Vec<serde_json::Value>,
+    #[serde(default)]
+    web_pages: Vec<serde_json::Value>,
+    #[serde(default)]
+    bot_runs: Vec<serde_json::Value>,
+    #[serde(default)]
+    agent_permissions: Vec<serde_json::Value>,
+    #[serde(default)]
+    workspace_allowlists: Vec<serde_json::Value>,
 }
 
 #[derive(serde::Serialize)]
@@ -876,11 +1139,21 @@ struct WhisperSegment {
     start: f64,
     end: f64,
     text: String,
+    /// openai-whisper per-segment mean log-probability (absent in whisper.cpp
+    /// JSON builds); converted to a 0..1 confidence = exp(avg_logprob).
+    #[serde(default)]
+    avg_logprob: Option<f64>,
+    /// Probability the segment is actually silence/no speech (0..1).
+    #[serde(default)]
+    no_speech_prob: Option<f64>,
 }
 
 #[derive(serde::Deserialize)]
 struct WhisperOutput {
     segments: Vec<WhisperSegment>,
+    /// Language whisper detected for the audio (top-level JSON field).
+    #[serde(default)]
+    language: Option<String>,
 }
 
 #[tauri::command]
@@ -888,6 +1161,31 @@ fn local_status(app: tauri::AppHandle) -> Result<String, String> {
     let path = database_path(&app)?;
     let _ = open_database(&app)?;
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Return the last `limit` lines of the application log (Diagnostics view).
+#[tauri::command]
+fn read_app_log(limit: Option<usize>) -> Result<String, String> {
+    Ok(logging::read_tail(limit.unwrap_or(300)))
+}
+
+/// Absolute path of the application log file (Diagnostics view).
+#[tauri::command]
+fn app_log_path() -> Result<String, String> {
+    Ok(logging::log_path().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|| "Logging not initialized".into()))
+}
+
+/// Forward a frontend-originated message into the application log. The web
+/// view cannot write files, so errors caught in JS are shipped here.
+#[tauri::command]
+fn log_event(level: String, source: String, message: String) -> Result<(), String> {
+    match level.to_lowercase().as_str() {
+        "debug" => log::debug!("[ui:{source}] {message}"),
+        "warn" => log::warn!("[ui:{source}] {message}"),
+        "error" => log::error!("[ui:{source}] {message}"),
+        _ => log::info!("[ui:{source}] {message}"),
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -926,17 +1224,19 @@ fn set_data_directory(app: tauri::AppHandle, directory: String) -> Result<String
     if !target.is_absolute() { return Err("Data directory must be an absolute path".into()); }
     std::fs::create_dir_all(&target).map_err(|error| error.to_string())?;
     let current = database_path(&app)?;
-    let destination = target.join("neural-agent-os.sqlite");
+    let destination = target.join("database/neural-agent-os.sqlite");
     if current != destination && current.is_file() && !destination.exists() {
+        std::fs::create_dir_all(target.join("database")).map_err(|error| error.to_string())?;
         std::fs::copy(&current, &destination).map_err(|error| error.to_string())?;
         for suffix in ["-wal", "-shm"] {
             let sidecar = std::path::PathBuf::from(format!("{}{}", current.to_string_lossy(), suffix));
-            if sidecar.is_file() { let _ = std::fs::copy(&sidecar, target.join(format!("neural-agent-os.sqlite{}", suffix))); }
+            if sidecar.is_file() { let _ = std::fs::copy(&sidecar, target.join("database").join(format!("neural-agent-os.sqlite{}", suffix))); }
         }
     }
     let default_directory = app.path().app_data_dir().map_err(|error| error.to_string())?;
     std::fs::create_dir_all(&default_directory).map_err(|error| error.to_string())?;
     std::fs::write(default_directory.join("data-directory.txt"), target.to_string_lossy().as_bytes()).map_err(|error| error.to_string())?;
+    set_data_root(target.clone());
     Ok(target.to_string_lossy().into_owned())
 }
 
@@ -1037,7 +1337,11 @@ fn index_sources(app: tauri::AppHandle, workspace_id: String) -> Result<IndexRes
     // content hash changed since the last index (status is not a reliable
     // change signal on its own).
     let mut sources = connection.prepare(
-        "SELECT id, uri, status, content_hash FROM sources WHERE workspace_id = ?1 AND (status != 'indexed' OR content_hash IS NULL OR indexed_at IS NULL)",
+        // Read every URI-backed source so changed files can be detected by
+        // content hash. The unchanged fast path below avoids rebuilding its
+        // chunks/FTS rows; filtering only by status would miss edits made
+        // after a source was first indexed.
+        "SELECT id, uri, status, content_hash FROM sources WHERE workspace_id = ?1 AND uri IS NOT NULL",
     ).map_err(|error| error.to_string())?;
     let rows = sources.query_map(params![workspace_id], |row| Ok((
         row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?,
@@ -1055,8 +1359,10 @@ fn index_sources(app: tauri::AppHandle, workspace_id: String) -> Result<IndexRes
         let content_hash = content_sha256(&content);
         // Skip unchanged, already-indexed sources (incremental fast path).
         if status == "indexed" && previous_hash.as_deref() == Some(content_hash.as_str()) {
+            log::debug!("index_sources: unchanged source {source_id}; skipping derived index");
             continue;
         }
+        log::info!("index_sources: indexing changed/new source {source_id} (previous_hash_present={})", previous_hash.is_some());
         let chunks: Vec<&str> = content.as_bytes().chunks(1800).filter_map(|bytes| std::str::from_utf8(bytes).ok()).map(str::trim).filter(|chunk| !chunk.is_empty()).collect();
         connection.execute("DELETE FROM source_search WHERE source_id = ?1", params![source_id]).map_err(|error| error.to_string())?;
         connection.execute("DELETE FROM source_chunks WHERE source_id = ?1", params![source_id]).map_err(|error| error.to_string())?;
@@ -1085,12 +1391,25 @@ fn content_sha256(content: &str) -> String {
     hash.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
+/// Build a safe FTS5 MATCH expression from free-text input. Every
+/// whitespace-separated term is emitted as a quoted literal string (FTS5
+/// escapes embedded quotes by doubling them), so user queries containing FTS5
+/// syntax characters (`,`, `(`, `)`, `"`, `-`, `*`, `^`, `:`, `NEAR`…) are
+/// matched literally and can never raise `fts5: syntax error near …`.
+pub(crate) fn fts5_match_terms(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(" OR ")
+}
+
 #[tauri::command]
 fn search_sources(app: tauri::AppHandle, workspace_id: String, query: String) -> Result<Vec<SearchResult>, String> {
     let query = query.trim();
     if query.is_empty() { return Ok(Vec::new()); }
     let connection = open_database(&app)?;
-    let match_query = query.split_whitespace().map(|term| format!("{}", term.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
+    let match_query = fts5_match_terms(&query);
     let mut statement = connection.prepare(
         "SELECT search.source_id, sources.title, sources.uri, search.chunk_id, search.content
          FROM source_search search JOIN sources ON sources.id = search.source_id
@@ -1241,14 +1560,18 @@ fn list_meetings(app: tauri::AppHandle, workspace_id: String) -> Result<Vec<Meet
 }
 
 #[tauri::command]
-fn queue_transcription(app: tauri::AppHandle, meeting_id: String, provider: String) -> Result<TranscriptionJob, String> {
+fn queue_transcription(app: tauri::AppHandle, meeting_id: String, provider: String, language: Option<String>) -> Result<TranscriptionJob, String> {
+    log::info!("queue_transcription: meeting={meeting_id} provider={provider} language={language:?}");
     let connection = open_database(&app)?;
     let workspace_id: String = connection.query_row("SELECT workspace_id FROM meetings WHERE id = ?1", params![meeting_id], |row| row.get(0)).map_err(|error| error.to_string())?;
     let provider = routed_model(&connection, &workspace_id, "transcription", &provider);
     let exists: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)", params![meeting_id], |row| row.get(0)).map_err(|error| error.to_string())?;
     if !exists { return Err("Meeting was not found".into()); }
     let id = format!("transcription-{}", uuid::Uuid::new_v4());
-    connection.execute("INSERT INTO transcription_jobs (id, meeting_id, provider, status) VALUES (?1, ?2, ?3, 'queued')", params![id, meeting_id, provider]).map_err(|error| error.to_string())?;
+    connection.execute("INSERT INTO transcription_jobs (id, meeting_id, provider, status, language) VALUES (?1, ?2, ?3, 'queued', ?4)", params![id, meeting_id, provider, language]).map_err(|error| error.to_string())?;
+    if let Some(lang) = language.as_deref().filter(|l| !l.trim().is_empty()) {
+        let _ = connection.execute("UPDATE meetings SET language = ?1 WHERE id = ?2", params![lang, meeting_id]);
+    }
     connection.execute("UPDATE meetings SET status = 'transcription_queued' WHERE id = ?1", params![meeting_id]).map_err(|error| error.to_string())?;
     Ok(TranscriptionJob { id, meeting_id, provider, status: "queued".into(), error: None })
 }
@@ -1264,39 +1587,174 @@ fn list_transcription_jobs(app: tauri::AppHandle, meeting_id: String) -> Result<
 /// Run Whisper on a meeting's recording and store transcript segments, then
 /// auto-diarize. Returns the number of segments. Shared by the manual
 /// transcription command and the scheduled queue (sequential, one at a time).
-pub(crate) fn transcribe_meeting(app: &tauri::AppHandle, meeting_id: &str, provider: &str) -> Result<usize, String> {
-    let connection = open_database(app)?;
+/// Map an openai-whisper segment to a 0..1 confidence value.
+/// Base = exp(mean token log-probability); when the backend also reports a
+/// no-speech probability, segments that are mostly silence are down-weighted
+/// (they are often hallucinated). None when the JSON backend reports neither.
+fn whisper_confidence(segment: &WhisperSegment) -> Option<f32> {
+    let base = segment.avg_logprob.map(|lp| (lp.exp().clamp(0.0, 1.0)) as f32);
+    let no_speech = segment.no_speech_prob.map(|p| (1.0 - p).clamp(0.0, 1.0) as f32);
+    match (base, no_speech) {
+        (Some(conf), Some(ns)) => Some(conf * ns),
+        (Some(conf), None) => Some(conf),
+        (None, Some(ns)) => Some(ns),
+        (None, None) => None,
+    }
+}
+
+pub(crate) fn transcribe_meeting(connection: &Connection, meeting_id: &str, provider: &str, model: &str, language: &str) -> Result<usize, String> {
+    log::info!("transcribe_meeting: meeting={meeting_id} provider={provider} model={model}");
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+        params![meeting_id],
+        |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    if !exists {
+        log::error!("transcribe_meeting: meeting {meeting_id} does not exist");
+        return Err(format!("Meeting not found: {meeting_id}"));
+    }
     let recording_path: String = connection.query_row(
         "SELECT recording_path FROM meetings WHERE id = ?1",
         params![meeting_id],
         |row| row.get::<_, Option<String>>(0).map(|value| value.unwrap_or_default()),
     ).map_err(|error| error.to_string())?;
     if recording_path.is_empty() {
+        log::error!("transcribe_meeting: meeting {meeting_id} has no recording path");
         return Err("Meeting has no recording file to transcribe".into());
     }
-    let whisper = std::env::var("NEURAL_WHISPER_BIN").unwrap_or_else(|_| "whisper".into());
-    let output = std::process::Command::new(&whisper)
-        .args([recording_path.as_str(), "--language", match provider { "hi" => "hi", "te" => "te", _ => "en" }, "--output_format", "json", "--output_dir", &std::env::temp_dir().to_string_lossy()])
-        .output();
+    let recording = std::path::Path::new(&recording_path);
+    if !recording.is_file() {
+        log::error!("transcribe_meeting: recording file missing on disk: path={recording_path} meeting_id={meeting_id}");
+        return Err(format!("Permanent: Recording file does not exist: {recording_path}"));
+    }
+    let recording_bytes = std::fs::metadata(recording).map(|m| m.len()).unwrap_or(0);
+    if recording_bytes == 0 {
+        log::error!("transcribe_meeting: empty recording path={recording_path} meeting_id={meeting_id} bytes=0");
+        return Err(format!("Permanent: Recording file is empty: {recording_path}"));
+    }
+    log::info!("transcribe_meeting: input validated meeting_id={meeting_id} path={recording_path} bytes={recording_bytes}");
+    // Any whisper-compatible CLI works: openai-whisper, faster-whisper,
+    // whisper.cpp, or a local wrapper — resolved via NEURAL_WHISPER_BIN,
+    // well-known install locations, or PATH.
+    let whisper = match resolve_binary("whisper", "NEURAL_WHISPER_BIN") {
+        Ok(bin) => bin,
+        Err(error) => { log::error!("transcribe_meeting: whisper binary unavailable: {error}"); return Err(error); }
+    };
+    // The workspace's transcription route model wins; fall back to the
+    // NEURAL_WHISPER_MODEL env var, then the default small model.
+    let whisper_model = if model.trim().is_empty() {
+        std::env::var("NEURAL_WHISPER_MODEL").unwrap_or_else(|_| "small".into())
+    } else {
+        model.trim().to_string()
+    };
+    // Explicit language selection (en/hi/te) wins; empty means auto-detect
+    // (whisper detects the language and reports it in the JSON output).
+    let whisper_language: Option<String> = match language.trim() {
+        "" => None,
+        lang => Some(lang.to_string()),
+    };
+    log::info!("transcribe_meeting: whisper={whisper} model={whisper_model} language={whisper_language:?} audio={recording_path}");
+    let mut whisper_cmd = std::process::Command::new(&whisper);
+    whisper_cmd.arg(recording_path.as_str())
+        .args(["--output_format", "json", "--output_dir", &data_subdir("transcripts").to_string_lossy()]);
+    // Only pass --model to CLIs that understand it (openai-whisper); mlx-whisper
+    // uses its own model naming (mlx-community/...) and errors on routed names
+    // like "whisper-large-v3", so let it fall back to its fast default.
+    if whisper_caps(&whisper).0 {
+        whisper_cmd.args(["--model", &whisper_model]);
+    }
+    if let Some(lang) = &whisper_language {
+        whisper_cmd.args(["--language", lang]);
+    }
+    let output = whisper_cmd.output();
     let result = match output {
         Ok(output) if output.status.success() => {
-            let json_path = std::env::temp_dir().join(format!("{}.json", std::path::Path::new(&recording_path).file_stem().and_then(|name| name.to_str()).unwrap_or("audio")));
-            let parsed = std::fs::read_to_string(&json_path).ok().and_then(|content| serde_json::from_str::<WhisperOutput>(&content).ok());
-            if let Some(transcript) = parsed {
-                connection.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", params![meeting_id]).map_err(|error| error.to_string())?;
-                let count = transcript.segments.len();
-                for (index, segment) in transcript.segments.iter().enumerate() {
-                    connection.execute("INSERT INTO transcript_segments (id, meeting_id, start_seconds, end_seconds, text) VALUES (?1, ?2, ?3, ?4, ?5)", params![format!("segment-{}-{}", meeting_id, index), meeting_id, segment.start, segment.end, segment.text.trim()]).map_err(|error| error.to_string())?;
+            let json_path = data_subdir("transcripts").join(format!("{}.json", std::path::Path::new(&recording_path).file_stem().and_then(|name| name.to_str()).unwrap_or("audio")));
+            log::info!("transcribe_meeting: whisper exited 0, expecting JSON at {}", json_path.display());
+            // Some whisper builds (e.g. mlx_whisper with an undecodable file)
+            // exit 0 while writing nothing — surface the captured output so
+            // the real cause (e.g. "moov atom not found") is visible.
+            if !json_path.is_file() {
+                let stdout_tail = String::from_utf8_lossy(&output.stdout);
+                let stderr_tail = String::from_utf8_lossy(&output.stderr);
+                let detail = if !stderr_tail.trim().is_empty() { stderr_tail } else { stdout_tail };
+                let detail = detail.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+                log::error!("transcribe_meeting: whisper exited 0 but wrote no JSON for {recording_path}; output: {detail}");
+                return Err(format!(
+                    "Whisper exited successfully but produced no transcript for {recording_path}.                      This usually means the audio file is empty or corrupt. Decoder output: {detail}"
+                ));
+            }
+            let content = match std::fs::read_to_string(&json_path) {
+                Ok(content) => content,
+                Err(error) => {
+                    log::error!("transcribe_meeting: could not read {}: {error}", json_path.display());
+                    return Err(format!("Could not read whisper output {}: {error}", json_path.display()));
                 }
-                connection.execute("UPDATE meetings SET status = 'transcribed' WHERE id = ?1", params![meeting_id]).map_err(|error| error.to_string())?;
-                // Auto-diarize after transcription completes
-                let ws_id: String = connection.query_row("SELECT workspace_id FROM meetings WHERE id = ?1", params![meeting_id], |row| row.get(0)).unwrap_or_default();
-                let _ = diarization::diarize_transcript(&connection, meeting_id, &ws_id, "nomic-embed-text", 0.7);
-                Ok(count)
-            } else { Err("Whisper completed but its JSON output could not be read".into()) }
+            };
+            match serde_json::from_str::<WhisperOutput>(&content) {
+                Ok(transcript) => {
+                    connection.execute("DELETE FROM transcript_segments WHERE meeting_id = ?1", params![meeting_id]).map_err(|error| error.to_string())?;
+                    let count = transcript.segments.len();
+                    for (index, segment) in transcript.segments.iter().enumerate() {
+                        connection.execute("INSERT INTO transcript_segments (id, meeting_id, start_seconds, end_seconds, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![format!("segment-{}-{}", meeting_id, index), meeting_id, segment.start, segment.end, segment.text.trim(), whisper_confidence(segment)]).map_err(|error| error.to_string())?;
+                    }
+                    // Record the language: explicit selection wins; otherwise
+                    // keep what whisper detected from the audio.
+                    let effective_language = if let Some(lang) = &whisper_language {
+                        Some(lang.as_str())
+                    } else {
+                        transcript.language.as_deref()
+                    };
+                    if let Some(lang) = effective_language {
+                        let _ = connection.execute("UPDATE meetings SET language = ?1 WHERE id = ?2", params![lang, meeting_id]);
+                    }
+                    connection.execute("UPDATE meetings SET status = 'transcribed' WHERE id = ?1", params![meeting_id]).map_err(|error| error.to_string())?;
+                    log::info!("transcribe_meeting: stored {count} segments for meeting {meeting_id} (language={effective_language:?})");
+                    // Auto-diarize after transcription completes: prefer the
+                    // audio-based backend (scripts/diarize.py / NEURAL_DIARIZE_BIN);
+                    // fall back to transcript-text embedding matching.
+                    let ws_id: String = connection.query_row("SELECT workspace_id FROM meetings WHERE id = ?1", params![meeting_id], |row| row.get(0)).unwrap_or_default();
+                    let audio_result = diarization::diarize_audio(connection, meeting_id, &ws_id, &recording_path);
+                    match audio_result {
+                        Ok(Some(assigned)) => {
+                            log::info!("transcribe_meeting: audio diarization assigned {assigned} segments for {meeting_id}");
+                            let _ = retention::record_audit(connection, "diarization_audio", Some("local"), Some("meeting"), Some(&ws_id), &format!("Audio-based diarization assigned {assigned} segments for meeting {meeting_id}"));
+                        }
+                        Ok(None) => {
+                            log::info!("transcribe_meeting: audio diarization unavailable; using text-embedding fallback for {meeting_id}");
+                            let _ = retention::record_audit(connection, "diarization_text_fallback", Some("local"), Some("meeting"), Some(&ws_id), &format!("Audio diarizer not installed; text-embedding fallback used for meeting {meeting_id}"));
+                            match diarization::diarize_transcript(connection, meeting_id, &ws_id, "nomic-embed-text", 0.7) {
+                                Ok(_) => log::info!("transcribe_meeting: text-embedding diarization complete for {meeting_id}"),
+                                Err(error) => log::warn!("transcribe_meeting: text-embedding diarization failed for {meeting_id}: {error}"),
+                            }
+                        }
+                        Err(error) => {
+                            log::warn!("transcribe_meeting: audio diarization failed for {meeting_id}: {error}; using text-embedding fallback");
+                            let _ = retention::record_audit(connection, "diarization_audio_failed", Some("local"), Some("meeting"), Some(&ws_id), &format!("Audio diarization error for meeting {meeting_id}: {error}"));
+                            match diarization::diarize_transcript(connection, meeting_id, &ws_id, "nomic-embed-text", 0.7) {
+                                Ok(_) => log::info!("transcribe_meeting: text-embedding diarization complete for {meeting_id}"),
+                                Err(fallback_error) => log::warn!("transcribe_meeting: text-embedding diarization failed for {meeting_id}: {fallback_error}"),
+                            }
+                        }
+                    }
+                    Ok(count)
+                }
+                Err(error) => {
+                    let snippet: String = content.chars().take(300).collect();
+                    log::error!("transcribe_meeting: whisper JSON parse failed at {}: {error}; content: {snippet}", json_path.display());
+                    Err(format!("Whisper JSON output could not be parsed at {}: {error}", json_path.display()))
+                }
+            }
         }
-        Ok(output) => Err(format!("Whisper failed: {}", String::from_utf8_lossy(&output.stderr).trim())),
-        Err(error) => Err(format!("Transcription runtime unavailable: {error}. Install Whisper or set NEURAL_WHISPER_BIN.")),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            log::error!("transcribe_meeting: whisper failed (exit {:?}) for {recording_path}: {}", output.status.code(), stderr);
+            Err(if stderr.is_empty() { format!("Whisper failed with exit code {:?}", output.status.code()) } else { format!("Whisper failed: {stderr}") })
+        }
+        Err(error) => {
+            log::error!("transcribe_meeting: failed to launch whisper ({whisper}): {error}");
+            Err(format!("Transcription runtime unavailable: {error}. Install Whisper or set NEURAL_WHISPER_BIN."))
+        }
     };
     if result.is_err() {
         let _ = connection.execute("UPDATE meetings SET status = 'transcription_failed' WHERE id = ?1", params![meeting_id]);
@@ -1306,19 +1764,29 @@ pub(crate) fn transcribe_meeting(app: &tauri::AppHandle, meeting_id: &str, provi
 
 #[tauri::command]
 fn process_transcription_job(app: tauri::AppHandle, job_id: String) -> Result<TranscriptionJob, String> {
+    log::info!("process_transcription_job: job={job_id}");
     let connection = open_database(&app)?;
-    let (meeting_id, provider): (String, String) = connection.query_row(
-        "SELECT meeting_id, provider FROM transcription_jobs WHERE id = ?1",
-        params![job_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    let (meeting_id, provider, language): (String, String, Option<String>) = connection.query_row(
+        "SELECT meeting_id, provider, language FROM transcription_jobs WHERE id = ?1",
+        params![job_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     ).map_err(|error| error.to_string())?;
+    let workspace_id: String = connection.query_row(
+        "SELECT workspace_id FROM meetings WHERE id = ?1",
+        params![meeting_id], |row| row.get(0),
+    ).map_err(|error| error.to_string())?;
+    let model = routed_model(&connection, &workspace_id, "transcription", "");
     connection.execute("UPDATE transcription_jobs SET status = 'processing', updated_at = CURRENT_TIMESTAMP WHERE id = ?1", params![job_id]).map_err(|error| error.to_string())?;
-    let result = transcribe_meeting(&app, &meeting_id, &provider);
+    let result = transcribe_meeting(&connection, &meeting_id, &provider, &model, language.as_deref().unwrap_or(""));
     match &result {
-        Ok(_) => {
+        Ok(count) => {
             connection.execute("UPDATE transcription_jobs SET status = 'completed', updated_at = CURRENT_TIMESTAMP WHERE id = ?1", params![job_id]).map_err(|error| error.to_string())?;
+            log::info!("process_transcription_job: job_id={job_id} meeting_id={meeting_id} completed segments={count}");
+            let _ = retention::record_audit(&connection, "transcription_completed", Some("local"), Some("transcription"), Some(&workspace_id), &format!("job_id={job_id} meeting_id={meeting_id} segments={count}"));
             Ok(TranscriptionJob { id: job_id.clone(), meeting_id: meeting_id.clone(), provider, status: "completed".into(), error: None })
         }
         Err(error) => {
+            log::error!("process_transcription_job: job_id={job_id} meeting_id={meeting_id} failed: {error}");
+            let _ = retention::record_audit(&connection, "transcription_failed", Some("local"), Some("transcription"), Some(&workspace_id), &format!("job_id={job_id} meeting_id={meeting_id} error={error}"));
             connection.execute("UPDATE transcription_jobs SET status = 'failed', error = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2", params![error, job_id]).map_err(|db_error| db_error.to_string())?;
             Err(error.clone())
         }
@@ -1328,8 +1796,8 @@ fn process_transcription_job(app: tauri::AppHandle, job_id: String) -> Result<Tr
 #[tauri::command]
 fn list_transcript_segments(app: tauri::AppHandle, meeting_id: String) -> Result<Vec<TranscriptSegmentRecord>, String> {
     let connection = open_database(&app)?;
-    let mut statement = connection.prepare("SELECT id, speaker, start_seconds, end_seconds, text, confidence FROM transcript_segments WHERE meeting_id = ?1 ORDER BY start_seconds").map_err(|error| error.to_string())?;
-    let rows = statement.query_map(params![meeting_id], |row| Ok(TranscriptSegmentRecord { id: row.get(0)?, speaker: row.get(1)?, start_seconds: row.get(2)?, end_seconds: row.get(3)?, text: row.get(4)?, confidence: row.get(5)? })).map_err(|error| error.to_string())?;
+    let mut statement = connection.prepare("SELECT id, speaker, start_seconds, end_seconds, text, confidence, speaker_confidence FROM transcript_segments WHERE meeting_id = ?1 ORDER BY start_seconds").map_err(|error| error.to_string())?;
+    let rows = statement.query_map(params![meeting_id], |row| Ok(TranscriptSegmentRecord { id: row.get(0)?, speaker: row.get(1)?, start_seconds: row.get(2)?, end_seconds: row.get(3)?, text: row.get(4)?, confidence: row.get(5)?, speaker_confidence: row.get(6)? })).map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
 }
 
@@ -1343,6 +1811,7 @@ fn update_transcript_speaker(app: tauri::AppHandle, segment_id: String, speaker:
 
 #[tauri::command]
 fn summarize_meeting(app: tauri::AppHandle, meeting_id: String, model: String) -> Result<MeetingSummary, String> {
+    log::info!("summarize_meeting: meeting={meeting_id} requested_model={model}");
     let connection = open_database(&app)?;
     let workspace_id: String = connection.query_row("SELECT workspace_id FROM meetings WHERE id = ?1", params![meeting_id], |row| row.get(0)).map_err(|error| error.to_string())?;
     let model = routed_model(&connection, &workspace_id, "summarization", &model);
@@ -1364,6 +1833,7 @@ fn summarize_meeting(app: tauri::AppHandle, meeting_id: String, model: String) -
         actions.push(action);
         if actions.len() >= 20 { break; }
     }
+    log::info!("summarize_meeting: meeting={meeting_id} summary {} chars, {} actions extracted", summary_text.len(), actions.len());
     Ok(MeetingSummary { meeting_id, model, summary: summary_text, actions })
 }
 
@@ -1375,6 +1845,31 @@ fn promote_action_to_task(app: tauri::AppHandle, action_id: String, workspace_id
     connection.execute("INSERT INTO tasks (id, workspace_id, title, status) VALUES (?1, ?2, ?3, 'open')", params![id, workspace_id, title]).map_err(|error| error.to_string())?;
     connection.execute("UPDATE meeting_actions SET status = 'promoted' WHERE id = ?1", params![action_id]).map_err(|error| error.to_string())?;
     Ok(TaskRecord { id, workspace_id, title, due_at: None, status: "open".into() })
+}
+
+/// Load a meeting's stored summary and extracted action items (None when the
+/// meeting has never been summarized). Lets the UI re-open saved summaries.
+#[tauri::command]
+fn get_meeting_summary(app: tauri::AppHandle, meeting_id: String) -> Result<Option<MeetingSummary>, String> {
+    let connection = open_database(&app)?;
+    let row: Option<(String, String, String)> = match connection.query_row(
+        "SELECT meeting_id, model, summary FROM meeting_summaries WHERE meeting_id = ?1",
+        params![meeting_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ) {
+        Ok(values) => Some(values),
+        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let Some((mid, model, summary)) = row else { return Ok(None) };
+    let mut stmt = connection.prepare(
+        "SELECT id, title, owner, due_at, status FROM meeting_actions WHERE meeting_id = ?1 ORDER BY id"
+    ).map_err(|e| e.to_string())?;
+    let actions = stmt.query_map(params![meeting_id], |r| Ok(MeetingAction {
+        id: r.get(0)?, title: r.get(1)?, owner: r.get(2)?, due_at: r.get(3)?, status: r.get(4)?,
+    })).map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    log::info!("get_meeting_summary: meeting={meeting_id} actions={}", actions.len());
+    Ok(Some(MeetingSummary { meeting_id: mid, model, summary, actions }))
 }
 
 #[tauri::command]
@@ -1487,12 +1982,12 @@ fn delete_calendar_event(app: tauri::AppHandle, event_id: String, agent_id: Opti
             "SELECT workspace_id, provider FROM calendar_events WHERE id = ?1",
             params![event_id], |row| Ok((row.get(0)?, row.get(1)?))
         ).unwrap_or_default();
-        let perm = permissions::check_permission(&connection, agent, &workspace_id, "modify_calendar");
+        let perm = permissions::check_permission(&connection, agent, &workspace_id, "schedule_events");
         if !perm.allowed {
             return Err(format!("Permission denied: {}", perm.reason));
         }
         let approval = approvals::check_and_request_approval(
-            &connection, agent, &workspace_id, "modify_calendar",
+            &connection, agent, &workspace_id, "schedule_events",
             &format!("Delete calendar event {}", event_id),
             &serde_json::json!({"event_id": event_id}),
         )?;
@@ -1501,7 +1996,7 @@ fn delete_calendar_event(app: tauri::AppHandle, event_id: String, agent_id: Opti
         }
     }
     // Enqueue sync for connected providers before deleting
-    let (workspace_id, provider): (String, String) = connection.query_row(
+    let (_workspace_id, provider): (String, String) = connection.query_row(
         "SELECT workspace_id, provider FROM calendar_events WHERE id = ?1",
         params![event_id], |row| Ok((row.get(0)?, row.get(1)?))
     ).unwrap_or_default();
@@ -1537,9 +2032,54 @@ fn list_calendar_connections(app: tauri::AppHandle, workspace_id: String) -> Res
     rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
 }
 
+/// Provider-default IMAP host when the user doesn't supply one (mirrors the
+/// SMTP defaults used by `smtp_send`).
+fn default_imap_host(provider: &str) -> Option<&'static str> {
+    match provider {
+        "gmail" => Some("imap.gmail.com"),
+        "outlook" => Some("outlook.office365.com"),
+        _ => None,
+    }
+}
+
+/// Provider-default SMTP host (kept in sync with `smtp_send`'s fallback).
+fn default_smtp_host(provider: &str) -> Option<&'static str> {
+    match provider {
+        "gmail" => Some("smtp.gmail.com"),
+        "outlook" => Some("smtp.office365.com"),
+        _ => None,
+    }
+}
+
+/// Well-known IMAP/SMTP hosts inferred from the account address domain, so a
+/// `user@gmail.com` / `user@yahoo.com` / `user@company.com` address gets the
+/// right mail servers without the user typing them. Unknown domains return
+/// None (the user supplies hosts manually).
+fn hosts_for_address(address: &str) -> (Option<&'static str>, Option<&'static str>) {
+    let domain = address.rsplit('@').next().unwrap_or("").trim().to_lowercase();
+    match domain.as_str() {
+        "gmail.com" | "googlemail.com" => (Some("imap.gmail.com"), Some("smtp.gmail.com")),
+        "outlook.com" | "hotmail.com" | "live.com" | "msn.com" | "office365.com" => (Some("outlook.office365.com"), Some("smtp-mail.outlook.com")),
+        "yahoo.com" | "ymail.com" | "rocketmail.com" => (Some("imap.mail.yahoo.com"), Some("smtp.mail.yahoo.com")),
+        "icloud.com" | "me.com" | "mac.com" => (Some("imap.mail.me.com"), Some("smtp.mail.me.com")),
+        "aol.com" => (Some("imap.aol.com"), Some("smtp.aol.com")),
+        "zoho.com" | "zohomail.com" => (Some("imap.zoho.com"), Some("smtp.zoho.com")),
+        _ => (None, None),
+    }
+}
+
 #[tauri::command]
 fn connect_email_account(app: tauri::AppHandle, workspace_id: String, provider: String, account_label: String, imap_host: Option<String>, smtp_host: Option<String>) -> Result<EmailAccountRecord, String> {
     if !["gmail", "outlook", "imap"].contains(&provider.as_str()) { return Err("Unsupported email provider".into()); }
+    // Default the hosts from the provider, then from the account address
+    // domain (so `user@yahoo.com` gets imap.mail.yahoo.com automatically).
+    let (imap_from_address, smtp_from_address) = hosts_for_address(&account_label);
+    let imap_host = imap_host
+        .or_else(|| default_imap_host(&provider).map(String::from))
+        .or_else(|| imap_from_address.map(String::from));
+    let smtp_host = smtp_host
+        .or_else(|| default_smtp_host(&provider).map(String::from))
+        .or_else(|| smtp_from_address.map(String::from));
     let id = format!("email-{}", uuid::Uuid::new_v4());
     let connection = open_database(&app)?;
     connection.execute("INSERT INTO email_accounts (id, workspace_id, provider, account_label, imap_host, smtp_host) VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT(workspace_id, provider, account_label) DO UPDATE SET imap_host = excluded.imap_host, smtp_host = excluded.smtp_host, status = 'needs_auth'", params![id, workspace_id, provider, account_label, imap_host, smtp_host]).map_err(|error| error.to_string())?;
@@ -1577,8 +2117,12 @@ fn delete_provider_secret(provider: String, secret_kind: String) -> Result<(), S
 #[tauri::command]
 fn sync_email_account(app: tauri::AppHandle, account_id: String) -> Result<EmailSyncResult, String> {
     let connection = open_database(&app)?;
-    let (provider, _account_label, imap_host): (String, String, Option<String>) = connection.query_row("SELECT provider, account_label, imap_host FROM email_accounts WHERE id = ?1", params![account_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|error| error.to_string())?;
-    let host = imap_host.ok_or_else(|| -> String { match provider.as_str() { "gmail" => "Set Gmail IMAP host to imap.gmail.com".to_string(), "outlook" => "Set Outlook IMAP host to outlook.office365.com".to_string(), _ => "IMAP host is required".to_string() } })?;
+    let (provider, account_label, imap_host): (String, String, Option<String>) = connection.query_row("SELECT provider, account_label, imap_host FROM email_accounts WHERE id = ?1", params![account_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|error| error.to_string())?;
+    let (imap_from_address, _) = hosts_for_address(&account_label);
+    let host = imap_host.clone()
+        .or_else(|| default_imap_host(&provider).map(String::from))
+        .or_else(|| imap_from_address.map(String::from))
+        .ok_or_else(|| -> String { "IMAP host is required for this provider".to_string() })?;
     let username = keyring::Entry::new("neural-agent-os/email", &format!("{account_id}:username")).map_err(|error| error.to_string())?.get_password().map_err(|error| error.to_string())?;
     let password = keyring::Entry::new("neural-agent-os/email", &format!("{account_id}:password")).map_err(|error| error.to_string())?.get_password().map_err(|error| error.to_string())?;
     let tls = native_tls::TlsConnector::builder().build().map_err(|error| error.to_string())?;
@@ -1628,7 +2172,7 @@ fn sync_email_oauth(app: tauri::AppHandle, account_id: String) -> Result<EmailSy
         _ => None,
     };
 
-    let mut fetched = 0usize;
+    let fetched: usize;
     let mut stored = 0usize;
 
     if let Some(token) = access_token {
@@ -1762,15 +2306,14 @@ fn list_emails(app: tauri::AppHandle, workspace_id: String, query: String) -> Re
 fn embed_sources(app: tauri::AppHandle, workspace_id: String, model: String) -> Result<EmbeddingResult, String> {
     let connection = open_database(&app)?;
     let model = routed_model(&connection, &workspace_id, "embeddings", &model);
+    let provider = chat::routed_provider(&connection, &workspace_id, "embeddings");
     let mut statement = connection.prepare("SELECT chunks.id, chunks.content FROM source_chunks chunks JOIN sources ON sources.id = chunks.source_id WHERE sources.workspace_id = ?1").map_err(|error| error.to_string())?;
     let rows = statement.query_map(params![workspace_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(|error| error.to_string())?;
-    let endpoint = std::env::var("NEURAL_OLLAMA_EMBEDDINGS_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/api/embeddings".into());
-    let client = reqwest::blocking::Client::new();
     let mut chunks_embedded = 0;
     for row in rows {
         let (chunk_id, content) = row.map_err(|error| error.to_string())?;
-        let response = client.post(&endpoint).json(&serde_json::json!({ "model": model, "prompt": content })).send().map_err(|error| format!("Ollama embeddings unavailable: {error}"))?.error_for_status().map_err(|error| error.to_string())?.json::<OllamaEmbeddingResponse>().map_err(|error| error.to_string())?;
-        connection.execute("INSERT INTO chunk_embeddings (chunk_id, model, vector_json) VALUES (?1, ?2, ?3) ON CONFLICT(chunk_id) DO UPDATE SET model = excluded.model, vector_json = excluded.vector_json, created_at = CURRENT_TIMESTAMP", params![chunk_id, model, serde_json::to_string(&response.embedding).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
+        let embedding = embed_text(&provider, &model, &content)?;
+        connection.execute("INSERT INTO chunk_embeddings (chunk_id, model, vector_json) VALUES (?1, ?2, ?3) ON CONFLICT(chunk_id) DO UPDATE SET model = excluded.model, vector_json = excluded.vector_json, created_at = CURRENT_TIMESTAMP", params![chunk_id, model, serde_json::to_string(&embedding).map_err(|error| error.to_string())?]).map_err(|error| error.to_string())?;
         chunks_embedded += 1;
     }
     Ok(EmbeddingResult { chunks_embedded, model })
@@ -1786,8 +2329,8 @@ fn semantic_search_sources(app: tauri::AppHandle, workspace_id: String, query: S
             &format!("Sent search query ({} chars) to cloud embedding model {}", query.len(), model));
     }
     let model = routed_model(&connection, &workspace_id, "embeddings", &model);
-    let endpoint = std::env::var("NEURAL_OLLAMA_EMBEDDINGS_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/api/embeddings".into());
-    let query_embedding = reqwest::blocking::Client::new().post(endpoint).json(&serde_json::json!({ "model": model, "prompt": query })).send().map_err(|error| error.to_string())?.error_for_status().map_err(|error| error.to_string())?.json::<OllamaEmbeddingResponse>().map_err(|error| error.to_string())?.embedding;
+    let provider = chat::routed_provider(&connection, &workspace_id, "embeddings");
+    let query_embedding = embed_text(&provider, &model, &query)?;
     let mut statement = connection.prepare("SELECT embeddings.chunk_id, embeddings.vector_json, chunks.source_id, chunks.content, sources.title, sources.uri FROM chunk_embeddings embeddings JOIN source_chunks chunks ON chunks.id = embeddings.chunk_id JOIN sources ON sources.id = chunks.source_id WHERE sources.workspace_id = ?1").map_err(|error| error.to_string())?;
     let rows = statement.query_map(params![workspace_id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?.unwrap_or_default()))).map_err(|error| error.to_string())?;
     let mut ranked = Vec::new();
@@ -1807,10 +2350,7 @@ fn ask_assistant(app: tauri::AppHandle, workspace_id: String, prompt: String, mo
     let model = routed_model(&connection, &workspace_id, "chat", &model);
 
     // Query-relevant context: use FTS5 search to find relevant chunks
-    let match_query = prompt.split_whitespace()
-        .map(|term| format!("{}", term.replace('"', "")))
-        .collect::<Vec<_>>()
-        .join(" OR ");
+    let match_query = fts5_match_terms(&prompt);
 
     // Search document chunks
     let mut doc_results: Vec<String> = Vec::new();
@@ -1957,10 +2497,122 @@ fn list_agent_runs(app: tauri::AppHandle, agent_id: String) -> Result<Vec<AgentR
     rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
 }
 
+/// One candidate for automatic recording, produced by the scheduler.
+#[derive(Debug, PartialEq)]
+struct AutoRecordPlan {
+    event_id: String,
+    workspace_id: String,
+    title: String,
+    ends_at: Option<String>,
+    action: String, // automatic | confirm | disabled | notice_required
+}
+
+/// Find calendar events starting within the auto-record window (±2 min) that
+/// have not yet been auto-recorded, and evaluate the recording rules for each.
+/// Pure DB logic, unit-testable.
+fn plan_auto_recordings(connection: &Connection) -> Result<Vec<AutoRecordPlan>, String> {
+    let now = Utc::now();
+    let floor = (now - chrono::Duration::seconds(60)).to_rfc3339();
+    let ceiling = (now + chrono::Duration::seconds(120)).to_rfc3339();
+    let mut stmt = connection.prepare(
+        "SELECT id, workspace_id, title, starts_at, ends_at, meeting_url FROM calendar_events
+         WHERE starts_at >= ?1 AND starts_at <= ?2 AND recording_auto_started IS NULL
+         ORDER BY starts_at ASC LIMIT 10",
+    ).map_err(|e| e.to_string())?;
+    let rows = stmt.query_map(params![floor, ceiling], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?))
+    }).map_err(|e| e.to_string())?;
+    let mut plans = Vec::new();
+    for row in rows {
+        let (event_id, workspace_id, title, _starts_at, ends_at, meeting_url) = row.map_err(|e| e.to_string())?;
+        let participants: Vec<String> = {
+            let mut pstmt = connection.prepare(
+                "SELECT name FROM calendar_participants WHERE event_id = ?1",
+            ).map_err(|e| e.to_string())?;
+            let rows = pstmt.query_map(params![event_id], |r| r.get::<_, String>(0)).map_err(|e| e.to_string())?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?
+        };
+        let action = calendar_complete::evaluate_recording_rules(connection, &workspace_id, &title, meeting_url.as_deref(), &participants)?;
+        log::debug!("plan_auto_recordings: event={event_id} title={title} action={action}");
+        plans.push(AutoRecordPlan { event_id, workspace_id, title, ends_at, action });
+    }
+    Ok(plans)
+}
+
+/// Scheduler-driven auto recording (#3): starts recordings for meetings that
+/// match an `automatic`/`notice_required` recording rule when they come due,
+/// and stops auto-started recordings shortly after the event's scheduled end.
+fn run_auto_recording(app: &tauri::AppHandle) {
+    // 1) Auto-stop: an auto-started recording whose event ended (>2 min ago).
+    {
+        let stop_at = RECORDER.lock().ok().and_then(|rec| rec.as_ref().and_then(|r| r.auto_stop_at.clone()));
+        if let Some(end) = stop_at {
+            let overdue = chrono::DateTime::parse_from_rfc3339(&end)
+                .map(|parsed| chrono::Utc::now() > parsed + chrono::Duration::minutes(2))
+                .unwrap_or(false);
+            if overdue {
+                let (ws, event_id, path) = RECORDER.lock().ok().map(|rec| rec.as_ref().map(|r| (r.workspace_id.clone(), r.event_id.clone().unwrap_or_default(), r.path.to_string_lossy().into_owned()))).flatten().unwrap_or_default();
+                match stop_local_recording(app.clone()) {
+                    Ok(_) => {
+                        log::info!("run_auto_recording: auto-stopped recording for event={event_id} path={path}");
+                        if let Ok(conn) = open_database(app) {
+                            let _ = retention::record_audit(&conn, "auto_record_stopped", None, Some("audio"), Some(&ws), &format!("Auto-stopped recording for event {event_id} at {path}"));
+                        }
+                    }
+                    Err(e) => log::error!("run_auto_recording: auto-stop failed for event={event_id}: {e}"),
+                }
+            }
+        }
+    }
+    // 2) Auto-start: only when no recording is already active.
+    let already_active = RECORDER.lock().map(|rec| rec.is_some()).unwrap_or(true);
+    if already_active { return; }
+    let Ok(connection) = open_database(app) else { return; };
+    let plans = match plan_auto_recordings(&connection) { Ok(p) => p, Err(e) => { log::warn!("run_auto_recording: planning failed: {e}"); return; } };
+    for plan in plans {
+        match plan.action.as_str() {
+            "automatic" | "notice_required" => {
+                let path = data_subdir("recordings").join(format!("meeting-{}-{}.m4a", plan.event_id, Utc::now().format("%Y%m%dT%H%M%S")));
+                let result = start_local_recording(
+                    app.clone(), path.to_string_lossy().into_owned(), "default".into(),
+                    Some(plan.workspace_id.clone()), Some(plan.title.clone()), None, vec![], true,
+                );
+                match result {
+                    Ok(_) => {
+                        let _ = connection.execute("UPDATE calendar_events SET recording_auto_started = ?1 WHERE id = ?2", params![Utc::now().to_rfc3339(), plan.event_id]);
+                        if let Ok(mut rec) = RECORDER.lock() {
+                            if let Some(r) = rec.as_mut() {
+                                r.event_id = Some(plan.event_id.clone());
+                                r.auto_stop_at = plan.ends_at.clone();
+                            }
+                        }
+                        log::info!("run_auto_recording: started event={} title={} path={}", plan.event_id, plan.title, path.display());
+                        let _ = retention::record_audit(&connection, "auto_record_started", None, Some("audio"), Some(&plan.workspace_id), &format!("Auto-started recording for event {} ({}): {}", plan.event_id, plan.title, path.display()));
+                        best_effort_notify(app, "Recording started", &format!("Auto-recording: {}", plan.title));
+                        return; // one recording at a time
+                    }
+                    Err(e) => {
+                        log::error!("run_auto_recording: start failed event={} title={}: {e}", plan.event_id, plan.title);
+                        let _ = retention::record_audit(&connection, "auto_record_failed", None, Some("audio"), Some(&plan.workspace_id), &format!("Auto-record start failed for event {}: {e}", plan.event_id));
+                    }
+                }
+            }
+            "confirm" => log::debug!("run_auto_recording: event={} requires confirmation; not auto-starting", plan.event_id),
+            _ => log::debug!("run_auto_recording: event={} disabled by rules", plan.event_id),
+        }
+    }
+}
+
 fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
     let connection = open_database(app)?;
-    // Check monitored folders for new files every 5 minutes
-    let _ = job_queue::process_next_job(app, &connection, "scheduler");
+    // Automatic meeting detection + recording (plan #3).
+    run_auto_recording(app);
+    // Process one queued job per tick (jobs run sequentially).
+    match job_queue::process_next_job(app, &connection, "scheduler") {
+        Ok(Some(job)) => log::info!("scheduler_tick: processed job {} ({})", job.id, job.job_type),
+        Ok(None) => {}
+        Err(error) => log::warn!("scheduler_tick: job processing error: {error}"),
+    }
     let _ = sync::process_sync_queue(app);
     let _ = approvals::expire_old_approvals(&connection);
     // Pull remote calendar changes on schedule (every 15 minutes)
@@ -2023,7 +2675,7 @@ fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
         } else { true }
     });
     if should_backup {
-        let backup_dir = app.path().app_data_dir().unwrap_or_default().join("backups");
+        let backup_dir = data_subdir("backups");
         let _ = std::fs::create_dir_all(&backup_dir);
         if let Ok(mut stmt) = connection.prepare("SELECT id FROM workspaces") {
             if let Ok(rows) = stmt.query_map([], |row| row.get::<_, String>(0)) {
@@ -2036,10 +2688,12 @@ fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let _ = monitoring::check_monitored_folders(app, &connection);
     // Retention policy: auto-cleanup old recordings (30+ days) if retention setting enabled
+    // Permanent retention is the privacy-safe default from the product plan;
+    // cleanup only runs after the user explicitly enables the policy.
     let auto_cleanup: bool = connection.query_row(
         "SELECT value = 'true' FROM app_settings WHERE key = 'autoRetentionCleanup'",
         [], |row| row.get(0)
-    ).unwrap_or(true);
+    ).unwrap_or(false);
     if auto_cleanup {
         // Use per-workspace retention policies when configured
         if let Ok(mut stmt) = connection.prepare("SELECT id FROM workspaces") {
@@ -2047,15 +2701,26 @@ fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
                 for ws_id in rows.filter_map(|r| r.ok()) {
                     let retention_days = retention::get_workspace_retention(&connection, &ws_id)?.unwrap_or(30);
                     let cutoff = chrono::Utc::now() - chrono::Duration::days(retention_days);
-                    let _ = connection.execute(
-                        "UPDATE meetings SET recording_path = NULL WHERE workspace_id = ?1 AND recording_path IS NOT NULL AND created_at < ?2",
-                        rusqlite::params![ws_id, cutoff.to_rfc3339()],
-                    );
+                    let candidates: Vec<(String, String)> = if let Ok(mut stmt) = connection.prepare(
+                        "SELECT id, recording_path FROM meetings WHERE workspace_id = ?1 AND recording_path IS NOT NULL AND COALESCE(started_at, created_at) < ?2",
+                    ) {
+                        stmt.query_map(
+                            rusqlite::params![ws_id, cutoff.to_rfc3339()],
+                            |row| Ok((row.get(0)?, row.get(1)?)),
+                        ).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+                    } else { Vec::new() };
+                    for (meeting_id, recording_path) in candidates {
+                        match std::fs::remove_file(&recording_path) {
+                            Ok(()) => log::info!("scheduler_tick: removed expired recording {recording_path}"),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => log::debug!("scheduler_tick: expired recording already absent {recording_path}"),
+                            Err(error) => { log::warn!("scheduler_tick: failed to remove expired recording {recording_path}: {error}"); continue; }
+                        }
+                        let _ = connection.execute("UPDATE meetings SET recording_path = NULL WHERE id = ?1", rusqlite::params![meeting_id]);
+                    }
                 }
             }
         }
-        // Also clean up recording files on disk for updated NULL paths
-        let _ = retention::cleanup_old_recordings(app, 30, false);
+        // Recording files are removed above before their DB paths are nulled.
         // Also cleanup old sync queue items (7+ days resolved)
         let _ = connection.execute(
             "DELETE FROM sync_queue WHERE status IN ('synced', 'failed', 'conflict') AND created_at < datetime('now', '-7 days')",
@@ -2085,7 +2750,7 @@ fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
         let agent_id = agent_id.map_err(|error| error.to_string())?;
         let active: bool = connection.query_row("SELECT status = 'active' FROM agents WHERE id = ?1", params![agent_id.clone()], |row| row.get(0)).unwrap_or(false);
         if active {
-            let _ = run_agent_now(app.clone(), agent_id, "qwen3:14b".into());
+            let _ = run_agent_now(app.clone(), agent_id, default_lmstudio_model());
         }
     }
     let mut statement = connection.prepare("SELECT id, schedule FROM agents WHERE status = 'active'").map_err(|error| error.to_string())?;
@@ -2097,29 +2762,63 @@ fn scheduler_tick(app: &tauri::AppHandle) -> Result<(), String> {
         let due = schedule.after(&(now - chrono::Duration::seconds(30))).next().map(|next| (next - now).num_seconds().abs() <= 30).unwrap_or(false);
         if !due { continue; }
         let already_ran: bool = connection.query_row("SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent_id = ?1 AND started_at >= datetime('now', '-50 seconds'))", params![agent_id], |row| row.get(0)).map_err(|error| error.to_string())?;
-        if !already_ran { let _ = run_agent_now(app.clone(), agent_id, "qwen3:14b".into()); }
+        if !already_ran { let _ = run_agent_now(app.clone(), agent_id, default_lmstudio_model()); }
     }
     Ok(())
+}
+
+/// Decode percent-encoded characters (%XX) in query-string values.
+/// '+' is treated as a space by callers before this runs.
+fn percent_decode(input: &str) -> String {
+    fn hex_val(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn start_local_api(app: tauri::AppHandle) {
     std::thread::spawn(move || {
         let Ok(server) = tiny_http::Server::http("127.0.0.1:8787") else { return; };
         for mut request in server.incoming_requests() {
-            let mut request_body = String::new();
+            let mut body_bytes: Vec<u8> = Vec::new();
             // Only read a body when the client actually sent one (Content-Length
             // > 0). Reading to EOF on a body-less GET over a keep-alive
             // connection would block the single-threaded server and stall every
-            // other request.
+            // other request. Bodies are read as raw bytes so binary payloads
+            // (e.g. encrypted Teams-bot recordings) survive intact; JSON routes
+            // convert lossily below.
             let body_length = request.body_length().unwrap_or(0);
             if body_length > 0 {
-                let _ = request.as_reader().take(body_length as u64).read_to_string(&mut request_body);
+                let _ = request.as_reader().take(body_length as u64).read_to_end(&mut body_bytes);
             }
+            let request_body = String::from_utf8_lossy(&body_bytes).into_owned();
             let full_url = request.url().to_string();
             let path = full_url.split('?').next().unwrap_or("/");
             let method = request.method().to_string();
-            println!("[api] {method} {path}");
-            let query_value = |key: &str| full_url.split('?').nth(1).and_then(|query| query.split('&').find_map(|part| { let mut pair = part.splitn(2, '='); (pair.next() == Some(key)).then(|| pair.next().unwrap_or("").replace('+', " ")) }));
+            log::info!("[api] {method} {path}");
+            let query_value = |key: &str| full_url.split('?').nth(1).and_then(|query| query.split('&').find_map(|part| {
+                let mut pair = part.splitn(2, '=');
+                (pair.next() == Some(key)).then(|| percent_decode(pair.next().unwrap_or("").replace('+', " ").as_str()))
+            }));
             let (status, body) = match path {
                 "/health" => (200, serde_json::json!({ "status": "ok", "local": true, "version": env!("CARGO_PKG_VERSION"), "timestamp": Utc::now().to_rfc3339() }).to_string()),
                 "/diagnostics" => {
@@ -2133,7 +2832,8 @@ fn start_local_api(app: tauri::AppHandle) {
                         "database_size_bytes": db_size,
                         "workspace_count": workspaces,
                         "ollama_url": std::env::var("NEURAL_OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434/api/generate".into()),
-                        "whisper_bin": std::env::var("NEURAL_WHISPER_BIN").unwrap_or_else(|_| "whisper".into()),
+                        "whisper_bin": resolve_binary("whisper", "NEURAL_WHISPER_BIN").unwrap_or_else(|_| "whisper".into()),
+                        "ffmpeg_bin": resolve_binary("ffmpeg", "NEURAL_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".into()),
                         "api_port": 8787,
                         "loopback_only": true,
                     }).to_string())
@@ -2149,14 +2849,70 @@ fn start_local_api(app: tauri::AppHandle) {
                 "/v1/approvals" => match query_value("workspace_id") { Some(workspace_id) => match list_pending_approvals(app.clone(), workspace_id) { Ok(approvals) => (200, serde_json::to_string(&approvals).unwrap_or_else(|_| "[]".into())), Err(error) => (500, serde_json::json!({ "error": error }).to_string()) }, None => (400, serde_json::json!({ "error": "workspace_id is required" }).to_string()) },
                 "/v1/permissions" => match (query_value("agent_id"), query_value("workspace_id")) { (Some(agent_id), Some(workspace_id)) => match check_all_permissions(app.clone(), agent_id, workspace_id) { Ok(perms) => (200, serde_json::to_string(&perms).unwrap_or_else(|_| "[]".into())), Err(error) => (500, serde_json::json!({ "error": error }).to_string()) }, _ => (400, serde_json::json!({ "error": "agent_id and workspace_id are required" }).to_string()) },
                 "/v1/memories" => match query_value("workspace_id") { Some(workspace_id) => match list_memories(app.clone(), workspace_id) { Ok(memories) => (200, serde_json::to_string(&memories).unwrap_or_else(|_| "[]".into())), Err(error) => (500, serde_json::json!({ "error": error }).to_string()) }, None => (400, serde_json::json!({ "error": "workspace_id is required" }).to_string()) },
-                "/v1/context/export" => match query_value("workspace_id") { Some(workspace_id) => match export_context(app.clone(), workspace_id) { Ok(context) => (200, serde_json::json!({ "workspace_id": "", "context": context }).to_string()), Err(error) => (500, serde_json::json!({ "error": error }).to_string()) }, None => (400, serde_json::json!({ "error": "workspace_id is required" }).to_string()) },
+                "/v1/context/export" => match query_value("workspace_id") { Some(workspace_id) => match export_context(app.clone(), workspace_id.clone()) { Ok(context) => (200, serde_json::json!({ "workspace_id": workspace_id, "context": context }).to_string()), Err(error) => (500, serde_json::json!({ "error": error }).to_string()) }, None => (400, serde_json::json!({ "error": "workspace_id is required" }).to_string()) },
+                "/v1/recording/start" => {
+                    if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
+                    else {
+                        let payload: serde_json::Value = serde_json::from_str(&request_body).unwrap_or_default();
+                        let rec_path = payload.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let source = payload.get("source").and_then(|v| v.as_str()).unwrap_or("default").to_string();
+                        let workspace_id = payload.get("workspace_id").and_then(|v| v.as_str()).map(String::from);
+                        match start_local_recording(app.clone(), rec_path, source, workspace_id, None, None, Vec::new(), true) {
+                            Ok(status) => (200, serde_json::to_string(&status).unwrap_or_default()),
+                            Err(e) => (500, serde_json::json!({ "error": e }).to_string()),
+                        }
+                    }
+                },
+                "/v1/recording/stop" => {
+                    if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
+                    else {
+                        match stop_local_recording(app.clone()) {
+                            Ok(status) => (200, serde_json::to_string(&status).unwrap_or_default()),
+                            Err(e) => (500, serde_json::json!({ "error": e }).to_string()),
+                        }
+                    }
+                },
+                                "/v1/tools/call" => {
+                    // Generic gated tool surface (#9): full agent_tools
+                    // catalogue with API-key auth, capability/approval
+                    // enforcement, workspace scoping, logging, and audit.
+                    if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
+                    else if let Ok(conn) = open_database(&app) {
+                        if let Err(auth_err) = require_api_auth(&conn, &request) {
+                            (401, serde_json::json!({ "error": auth_err }).to_string())
+                        } else {
+                            let payload: serde_json::Value = serde_json::from_str(&request_body).unwrap_or_default();
+                            let name = payload.get("tool").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let args = payload.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            match agent_tools::tool_by_name(&name) {
+                                None => (400, serde_json::json!({ "error": format!("Unknown tool: {name}") }).to_string()),
+                                Some(tool) => {
+                                    let workspace_id = args.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let agent_id = args.get("agent_id").and_then(|v| v.as_str()).unwrap_or("cli").to_string();
+                                    if tool.name != "list_agent_runs" && workspace_id.is_empty() {
+                                        (400, serde_json::json!({ "error": "workspace_id is required" }).to_string())
+                                    } else {
+                                        let run_id = format!("rest-{}", uuid::Uuid::new_v4());
+                                        match agent_tools::execute_agent_tool(&app, &conn, &workspace_id, &agent_id, &run_id, &name, &args) {
+                                            Ok(value) => (200, serde_json::json!({ "tool": name, "result": value }).to_string()),
+                                            Err(error) => {
+                                                let status = if error.starts_with("Permission denied") || error.starts_with("Approval required") { 403 } else { 400 };
+                                                (status, serde_json::json!({ "error": error }).to_string())
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    } else { (500, serde_json::json!({ "error": "Database unavailable" }).to_string()) }
+                },
                 "/v1/ask" => {
                     if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
                     else {
                         let payload: serde_json::Value = serde_json::from_str(&request_body).unwrap_or_default();
                         let ws_id = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("");
                         let prompt = payload.get("prompt").and_then(|v| v.as_str()).unwrap_or("");
-                        let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or("qwen3:14b").to_string();
+                        let model = payload.get("model").and_then(|v| v.as_str()).unwrap_or(&default_lmstudio_model()).to_string();
                         if ws_id.is_empty() || prompt.is_empty() { (400, serde_json::json!({ "error": "workspace_id and prompt are required" }).to_string()) }
                         else { match ask_assistant(app.clone(), ws_id.to_string(), prompt.to_string(), model) { Ok(reply) => (200, serde_json::to_string(&reply).unwrap_or_default()), Err(e) => (500, serde_json::json!({ "error": e }).to_string()) } }
                     }
@@ -2244,142 +3000,106 @@ fn start_local_api(app: tauri::AppHandle) {
                     let method = rpc.get("method").and_then(|value| value.as_str()).unwrap_or("");
                     let id = rpc.get("id").cloned().unwrap_or(serde_json::Value::Null);
                     match method {
-                        "tools/list" => (200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": [
-                            { "name": "search_workspace", "description": "Search indexed workspace knowledge.", "inputSchema": { "type": "object", "required": ["workspace_id", "query"] } },
-                            { "name": "list_tasks", "description": "List workspace tasks.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "list_meetings", "description": "List recent meetings in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "list_notes", "description": "List notes in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "search_transcripts", "description": "Search conversation transcripts in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id", "query"] } },
-                            { "name": "list_agent_runs", "description": "Inspect execution history for an agent.", "inputSchema": { "type": "object", "required": ["agent_id"] } },
-                            { "name": "create_note", "description": "Create a note in a workspace (requires approval unless explicitly granted).", "inputSchema": { "type": "object", "required": ["workspace_id", "title", "content", "agent_id"] } },
-                            { "name": "create_reminder", "description": "Schedule a reminder in a workspace (requires approval).", "inputSchema": { "type": "object", "required": ["workspace_id", "task_id", "title", "scheduled_at", "agent_id"] } },
-                            { "name": "list_calendar_events", "description": "List calendar events in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "list_emails", "description": "List recent emails in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "search_emails", "description": "Full-text search emails in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id", "query"] } },
-                            { "name": "list_reminders", "description": "List reminders in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "get_sync_status", "description": "Get calendar/email sync status for a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "list_memories", "description": "List saved memories in a workspace.", "inputSchema": { "type": "object", "required": ["workspace_id"] } },
-                            { "name": "create_task", "description": "Create a task in a workspace (requires approval unless explicitly granted).", "inputSchema": { "type": "object", "required": ["workspace_id", "title", "agent_id"] } },
-                            { "name": "create_memory", "description": "Save a memory in a workspace (requires approval unless explicitly granted).", "inputSchema": { "type": "object", "required": ["workspace_id", "content", "agent_id"] } }
-                        ] } }).to_string()),
+                        "tools/list" => (200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": agent_tools::mcp_tools_list() }).to_string()),
                         "tools/call" => {
-                            let params = rpc.get("params").and_then(|value| value.get("arguments")).cloned().unwrap_or_default();
-                            let name = rpc.get("params").and_then(|value| value.get("name")).and_then(|value| value.as_str()).unwrap_or("");
-                            let workspace_id = params.get("workspace_id").and_then(|value| value.as_str()).unwrap_or("").to_string();
-                            let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("mcp-client");
-
-                            // Write tools require API-key authentication
-                            let is_write_tool = matches!(name, "create_note" | "create_reminder" | "create_task" | "create_memory");
-                            if is_write_tool {
-                                if let Ok(conn) = open_database(&app) {
-                                    if let Err(auth_err) = require_api_auth(&conn, &request) {
-                                        let error_body = serde_json::json!({
-                                            "jsonrpc": "2.0", "id": id,
-                                            "error": { "code": -32001, "message": format!("Authentication required: {auth_err}") }
-                                        }).to_string();
-                                        let resp = tiny_http::Response::from_string(error_body).with_status_code(401);
-                                        let _ = request.respond(resp);
-                                        continue;
+                            // Shared tool surface (#9): the same catalogue and
+                            // permission/approval enforcement as the agent
+                            // runtime (agent_tools::execute_agent_tool).
+                            let rpc_args = rpc.get("params").cloned().unwrap_or_default();
+                            let name = rpc_args.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                            let params = rpc_args.get("arguments").cloned().unwrap_or_else(|| serde_json::json!({}));
+                            match agent_tools::tool_by_name(&name) {
+                                None => (400, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": format!("Unknown tool: {name}") } }).to_string()),
+                                Some(tool) => {
+                                    let workspace_id = params.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                    let agent_id = params.get("agent_id").and_then(|v| v.as_str()).unwrap_or("mcp-client").to_string();
+                                    if tool.name != "list_agent_runs" && workspace_id.is_empty() {
+                                        (400, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": "workspace_id is required" } }).to_string())
+                                    } else if let Ok(conn) = open_database(&app) {
+                                        // Consistent authentication: every tool call
+                                        // (read or write) requires an API key.
+                                        if let Err(auth_err) = require_api_auth(&conn, &request) {
+                                            let error_body = serde_json::json!({
+                                                "jsonrpc": "2.0", "id": id,
+                                                "error": { "code": -32001, "message": format!("Authentication required: {auth_err}") }
+                                            }).to_string();
+                                            let resp = tiny_http::Response::from_string(error_body).with_status_code(401);
+                                            let _ = request.respond(resp);
+                                            continue;
+                                        }
+                                        let run_id = format!("mcp-{}", uuid::Uuid::new_v4());
+                                        match agent_tools::execute_agent_tool(&app, &conn, &workspace_id, &agent_id, &run_id, &name, &params) {
+                                            Ok(value) => (200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": value.to_string() }] } }).to_string()),
+                                            Err(error) => {
+                                                let gated = error.starts_with("Permission denied") || error.starts_with("Approval required");
+                                                let code = if gated { -32000 } else { -32602 };
+                                                let status = if gated { 403 } else { 400 };
+                                                (status, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": error } }).to_string())
+                                            }
+                                        }
+                                    } else {
+                                        (500, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "Database unavailable" } }).to_string())
                                     }
                                 }
                             }
-
-                            // Permission gating for all MCP tool calls
-                            let capability = match name {
-                                "search_workspace" | "list_tasks" | "list_meetings" | "list_notes" | "search_transcripts" | "list_agent_runs" | "list_calendar_events" | "list_emails" | "search_emails" | "list_reminders" | "get_sync_status" | "list_memories" => "read_knowledge",
-                                "create_note" | "create_memory" => "create_notes",
-                                "create_reminder" => "create_reminders",
-                                "create_task" => "modify_tasks",
-                                _ => "",
-                            };
-
-                            if !capability.is_empty() {
-                                if let Ok(conn) = open_database(&app) {
-                                    let perm = permissions::check_permission(&conn, agent_id, &workspace_id, capability);
-                                    if !perm.allowed {
-                                        let error_body = serde_json::json!({
-                                            "jsonrpc": "2.0", "id": id,
-                                            "error": { "code": -32000, "message": format!("Permission denied: {} — {}", capability, perm.reason) }
-                                        }).to_string();
-                                        let resp = tiny_http::Response::from_string(error_body).with_status_code(403);
-                                        let _ = request.respond(resp);
-                                        continue;
-                                    }
-                                }
-                            }
-
-                            let result = match name { "search_workspace" => search_sources(app.clone(), workspace_id, params.get("query").and_then(|value| value.as_str()).unwrap_or("").to_string()).map(|value| serde_json::json!(value)), "list_tasks" => list_tasks(app.clone(), workspace_id).map(|value| serde_json::json!(value)), "list_meetings" => list_meetings(app.clone(), workspace_id).map(|value| serde_json::json!(value)), "list_notes" => list_notes(app.clone(), workspace_id).map(|value| serde_json::json!(value)), "search_transcripts" => conversation_search(app.clone(), workspace_id, params.get("query").and_then(|value| value.as_str()).unwrap_or("").to_string()).map(|value| serde_json::json!(value)), "list_agent_runs" => list_agent_runs(app.clone(), params.get("agent_id").and_then(|value| value.as_str()).unwrap_or("").to_string()).map(|value| serde_json::json!(value)), "create_note" => {
-                                let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                create_note(app.clone(), workspace_id.clone(), title, content).map(|value| serde_json::json!(value))
-                            }, "create_reminder" => {
-                                let task_id = params.get("task_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                let scheduled_at = params.get("scheduled_at").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                schedule_task_reminder(app.clone(), workspace_id.clone(), task_id, title, scheduled_at).map(|value| serde_json::json!(value))
-                            }, "list_calendar_events" => list_calendar_events(app.clone(), workspace_id).map(|value| serde_json::json!(value)),
-                            "list_emails" => list_emails(app.clone(), workspace_id, String::new()).map(|value| serde_json::json!(value)),
-                            "search_emails" => search_emails(app.clone(), workspace_id, params.get("query").and_then(|v| v.as_str()).unwrap_or("").to_string()).map(|value| serde_json::json!(value)),
-                            "list_reminders" => list_reminders(app.clone(), workspace_id).map(|value| serde_json::json!(value)),
-                            "get_sync_status" => get_sync_status(app.clone(), workspace_id).map(|value| serde_json::json!(value)),
-                            "list_memories" => list_memories(app.clone(), workspace_id).map(|value| serde_json::json!(value)),
-                            "create_task" => {
-                                let title = params.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                create_task(app.clone(), workspace_id.clone(), title, None).map(|value| serde_json::json!(value))
-                            }, "create_memory" => {
-                                let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                create_memory(app.clone(), workspace_id.clone(), content, None, None).map(|value| serde_json::json!(value))
-                            }, _ => Err("Unknown MCP tool".into()) };
-                            match result { Ok(value) => (200, serde_json::json!({ "jsonrpc": "2.0", "id": id, "result": { "content": [{ "type": "text", "text": value.to_string() }] } }).to_string()), Err(error) => (400, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32602, "message": error } }).to_string()) }
                         }
                         _ => (400, serde_json::json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32601, "message": "Method not found" } }).to_string()),
                     }
                 }
                 "/teams-bot/status" => {
-                    let payload: serde_json::Value = serde_json::from_str(&request_body).unwrap_or_default();
-                    let bot_id = payload.get("bot_id").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("unknown");
-                    let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                    let meeting_id = payload.get("meeting_id").and_then(|v| v.as_str());
-                    println!("[Teams Bot {bot_id}] {status}: {message}");
-                    let _ = open_database(&app).and_then(|conn| {
+                    if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
+                    else if let Err(auth_err) = teams_bot_auth(&request) { (401, serde_json::json!({ "error": auth_err }).to_string()) }
+                    else {
+                        let payload: serde_json::Value = serde_json::from_str(&request_body).unwrap_or_default();
+                        let bot_id = payload.get("bot_id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let status = payload.get("status").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                        let message = payload.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let meeting_id = payload.get("meeting_id").and_then(|v| v.as_str()).map(|s| s.to_string());
                         let ws_id: String = payload.get("workspace_id").and_then(|v| v.as_str()).unwrap_or("personal").to_string();
-                        conn.execute(
-                            "INSERT INTO bot_runs (id, workspace_id, bot_id, status, message, meeting_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                            params![format!("bot-run-{}", uuid::Uuid::new_v4()), ws_id, bot_id, status, message, meeting_id],
-                        ).map_err(|e| e.to_string())
-                    });
-                    if let Some(mid) = meeting_id {
+                        log::info!("[teams-bot] status bot_id={bot_id} status={status} meeting_id={meeting_id:?} workspace={ws_id}");
                         let _ = open_database(&app).and_then(|conn| {
-                            conn.execute("INSERT INTO transcription_jobs (id, meeting_id, provider, status) VALUES (?1, ?2, 'teams-bot', ?3)", params![format!("teams-status-{}", uuid::Uuid::new_v4()), mid, status])
-                                .map_err(|e| e.to_string())
+                            plan_extras::record_bot_run(&conn, &ws_id, &bot_id, &status, Some(&message), meeting_id.as_deref())?;
+                            retention::record_audit(&conn, "teams_bot_status", Some("teams-bot"), Some("meeting"), Some(&ws_id), &format!("Bot {bot_id} reported {status}: {message}"))
                         });
+                        if let Some(mid) = meeting_id {
+                            let _ = open_database(&app).and_then(|conn| {
+                                conn.execute("INSERT INTO transcription_jobs (id, meeting_id, provider, status) VALUES (?1, ?2, 'teams-bot', ?3)", params![format!("teams-status-{}", uuid::Uuid::new_v4()), mid, status])
+                                    .map_err(|e| e.to_string())
+                            });
+                        }
+                        (200, serde_json::json!({ "received": true, "bot_id": bot_id }).to_string())
                     }
-                    (200, serde_json::json!({ "received": true, "bot_id": bot_id }).to_string())
                 }
                 "/teams-bot/meetings" => {
-                    // Return upcoming meetings that have meeting URLs for bot participation
-                    match open_database(&app) {
-                        Ok(conn) => {
-                            let now = Utc::now();
-                            let cutoff = now + chrono::Duration::hours(48);
-                            let mut stmt = conn.prepare("SELECT id, workspace_id, title, starts_at, ends_at, meeting_url FROM calendar_events WHERE meeting_url IS NOT NULL AND starts_at >= ?1 AND starts_at <= ?2 ORDER BY starts_at LIMIT 20").map_err(|e| e.to_string());
-                            match stmt {
-                                Ok(mut s) => {
-                                    let rows: Result<Vec<serde_json::Value>, String> = s.query_map(params![now.to_rfc3339(), cutoff.to_rfc3339()], |row| Ok(serde_json::json!({
-                                        "id": row.get::<_, String>(0)?,
-                                        "workspace_id": row.get::<_, String>(1)?,
-                                        "title": row.get::<_, String>(2)?,
-                                        "starts_at": row.get::<_, String>(3)?,
-                                        "ends_at": row.get::<_, String>(4)?,
-                                        "meeting_url": row.get::<_, Option<String>>(5)?,
-                                    }))).map_err(|e| e.to_string()).and_then(|r| r.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string()));
-                                    match rows { Ok(r) => (200, serde_json::to_string(&r).unwrap_or_default()), Err(e) => (500, serde_json::json!({ "error": e }).to_string()) }
+                    // Return upcoming meetings that have meeting URLs for bot participation.
+                    // Bot-only endpoint: requires the shared-secret token.
+                    if let Err(auth_err) = teams_bot_auth(&request) { (401, serde_json::json!({ "error": auth_err }).to_string()) }
+                    else {
+                        match open_database(&app) {
+                            Ok(conn) => {
+                                let now = Utc::now();
+                                let cutoff = now + chrono::Duration::hours(48);
+                                let stmt = conn.prepare("SELECT id, workspace_id, title, starts_at, ends_at, meeting_url FROM calendar_events WHERE meeting_url IS NOT NULL AND starts_at >= ?1 AND starts_at <= ?2 ORDER BY starts_at LIMIT 20").map_err(|e| e.to_string());
+                                match stmt {
+                                    Ok(mut s) => {
+                                        let rows: Result<Vec<serde_json::Value>, String> = s.query_map(params![now.to_rfc3339(), cutoff.to_rfc3339()], |row| Ok(serde_json::json!({
+                                            "id": row.get::<_, String>(0)?,
+                                            "workspace_id": row.get::<_, String>(1)?,
+                                            "title": row.get::<_, String>(2)?,
+                                            "starts_at": row.get::<_, String>(3)?,
+                                            "ends_at": row.get::<_, String>(4)?,
+                                            "meeting_url": row.get::<_, Option<String>>(5)?,
+                                        }))).map_err(|e| e.to_string()).and_then(|r| r.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string()));
+                                        match rows {
+                                            Ok(r) => { log::info!("[teams-bot] meetings returned {} upcoming", r.len()); (200, serde_json::to_string(&r).unwrap_or_default()) }
+                                            Err(e) => (500, serde_json::json!({ "error": e }).to_string())
+                                        }
+                                    }
+                                    Err(e) => (500, serde_json::json!({ "error": e }).to_string())
                                 }
-                                Err(e) => (500, serde_json::json!({ "error": e }).to_string())
                             }
+                            Err(e) => (500, serde_json::json!({ "error": e }).to_string())
                         }
-                        Err(e) => (500, serde_json::json!({ "error": e }).to_string())
                     }
                 }
                 "/vexa/webhook" => {
@@ -2455,32 +3175,67 @@ fn start_local_api(app: tauri::AppHandle) {
                     (200, serde_json::json!({ "received": true }).to_string())
                 }
                 "/teams-bot/upload" => {
-                    // Handle encrypted recording upload from Teams bot (legacy)
-                    let meeting_id = query_value("meeting_id").unwrap_or_default();
-                    let title = query_value("title").unwrap_or_else(|| "Teams recording".into());
-                    if meeting_id.is_empty() {
-                        (400, serde_json::json!({ "error": "meeting_id is required" }).to_string())
-                    } else {
-                        let data_dir = app.path().app_data_dir().unwrap_or_default();
-                        let recordings_dir = data_dir.join("teams-recordings");
-                        let _ = std::fs::create_dir_all(&recordings_dir);
-                        let output_path = recordings_dir.join(format!("{}.enc", meeting_id));
-                        match std::fs::write(&output_path, request_body.as_bytes()) {
-                            Ok(_) => {
-                                let _ = open_database(&app).and_then(|conn| {
-                                    let mid = format!("meeting-{}", uuid::Uuid::new_v4());
-                                    conn.execute("INSERT INTO meetings (id, workspace_id, title, recording_path, status) VALUES (?1, 'personal', ?2, ?3, 'ready_for_transcription')", params![mid, title, output_path.to_string_lossy().into_owned()])
-                                        .map_err(|e| e.to_string())
-                                });
-                                (200, serde_json::json!({ "received": true, "meeting_id": meeting_id, "path": output_path.to_string_lossy() }).to_string())
+                    // Encrypted recording upload from the Teams bot. Contract:
+                    //   POST /teams-bot/upload?meeting_id=<id>&title=<title>
+                    //   Header: X-Teams-Bot-Token: <shared secret>
+                    //   Body: nonce(12) || AES-256-GCM ciphertext+tag of the recording
+                    // The body is read as raw bytes (binary-safe) and the recording
+                    // is decrypted and validated locally before it is stored.
+                    if method.as_str() != "POST" { (405, serde_json::json!({ "error": "POST required" }).to_string()) }
+                    else if let Err(auth_err) = teams_bot_auth(&request) { (401, serde_json::json!({ "error": auth_err }).to_string()) }
+                    else {
+                        let meeting_id = query_value("meeting_id").unwrap_or_default();
+                        let title = query_value("title").unwrap_or_else(|| "Teams recording".into());
+                        if meeting_id.is_empty() {
+                            (400, serde_json::json!({ "error": "meeting_id is required" }).to_string())
+                        } else {
+                            match teams_bot::shared_secret() {
+                                None => (500, serde_json::json!({ "error": "NAO_TEAMS_BOT_SECRET is not configured on the app" }).to_string()),
+                                Some(secret) => {
+                                    let key = teams_bot::derive_key(&secret);
+                                    match teams_bot::decrypt_recording(&key, &body_bytes) {
+                                        Err(e) => {
+                                            log::error!("[teams-bot] upload rejected meeting_id={meeting_id}: {e}");
+                                            let _ = open_database(&app).and_then(|conn| retention::record_audit(&conn, "teams_bot_upload_failed", Some("teams-bot"), Some("meeting"), Some("personal"), &format!("Upload for {meeting_id} rejected: {e}")));
+                                            (400, serde_json::json!({ "error": e }).to_string())
+                                        }
+                                        Ok(plaintext) => {
+                                            let recordings_dir = data_subdir("teams-recordings");
+                                            let _ = std::fs::create_dir_all(&recordings_dir);
+                                            let output_path = recordings_dir.join(format!("{}.wav", meeting_id));
+                                            match std::fs::write(&output_path, &plaintext) {
+                                                Ok(_) => {
+                                                    let result = open_database(&app).and_then(|conn| {
+                                                        let mid = format!("meeting-{}", uuid::Uuid::new_v4());
+                                                        conn.execute("INSERT INTO meetings (id, workspace_id, title, recording_path, status) VALUES (?1, 'personal', ?2, ?3, 'ready_for_transcription')", params![mid, title, output_path.to_string_lossy().into_owned()])
+                                                            .map_err(|e| e.to_string())?;
+                                                        retention::record_audit(&conn, "teams_bot_upload", Some("teams-bot"), Some("meeting"), Some("personal"), &format!("Encrypted recording {meeting_id} received, decrypted and stored at {}", output_path.display()))?;
+                                                        Ok(mid)
+                                                    });
+                                                    match result {
+                                                        Ok(mid) => {
+                                                            log::info!("[teams-bot] upload ok meeting_id={meeting_id} decrypted={} bytes stored={} meeting_row={mid}", plaintext.len(), output_path.display());
+                                                            (200, serde_json::json!({ "received": true, "meeting_id": meeting_id, "meeting_row": mid, "decrypted": true, "bytes": plaintext.len(), "path": output_path.to_string_lossy() }).to_string())
+                                                        }
+                                                        Err(e) => (500, serde_json::json!({ "error": format!("Failed to record meeting: {e}") }).to_string())
+                                                    }
+                                                }
+                                                Err(e) => (500, serde_json::json!({ "error": format!("Failed to save recording: {e}") }).to_string())
+                                            }
+                                        }
+                                    }
+                                }
                             }
-                            Err(e) => (500, serde_json::json!({ "error": format!("Failed to save recording: {e}") }).to_string())
                         }
                     }
                 }
                 _ => (404, serde_json::json!({ "error": "not_found" }).to_string()),
             };
-            println!("[api] {method} {path} -> {status}");
+            if status >= 400 {
+                log::error!("[api] {method} {path} -> HTTP {status}: {body}");
+            } else {
+                log::info!("[api] {method} {path} -> HTTP {status}");
+            }
             let response = tiny_http::Response::from_string(body).with_status_code(status).with_header(tiny_http::Header::from_bytes("Content-Type", "application/json").expect("valid header"));
             let _ = request.respond(response);
         }
@@ -2493,6 +3248,94 @@ fn start_local_api(app: tauri::AppHandle) {
 // For now, add /vexa/* routes to the API server by patching start_local_api.
 // (Routes registered above in the match block)
 
+const MAX_AGENT_STEPS: usize = 6;
+
+/// Fire a desktop notification without ever panicking the caller: the
+/// notification plugin may not be registered (tests, plugin load failure).
+fn best_effort_notify(app: &tauri::AppHandle, title: &str, body: &str) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = app.notification().builder().title(title).body(body).show();
+    }));
+    if result.is_err() {
+        log::warn!("best_effort_notify: notification plugin unavailable, skipped notification \"{title}\"");
+    }
+}
+
+/// The agent tool-calling loop (#7), independent of the Tauri runtime so it is
+/// unit-testable with a scripted model + fake tool executor. Runs up to
+/// MAX_AGENT_STEPS rounds: the model may emit a JSON tool call (executed via
+/// `execute_tool`, result fed back) or plain text (final answer). Returns
+/// `Ok((final_text, steps))` or `Err(message)` when the model errored or the
+/// step budget was exhausted without a final answer.
+struct AgentLoopOutcome {
+    final_text: String,
+    steps: Vec<serde_json::Value>,
+    error: Option<String>,
+}
+
+fn run_agent_loop(
+    workspace_id: &str,
+    agent_id: &str,
+    agent_name: &str,
+    prompt: &str,
+    mut model_call: impl FnMut(&str) -> Result<String, String>,
+    mut execute_tool: impl FnMut(&str, &serde_json::Value) -> Result<serde_json::Value, String>,
+) -> AgentLoopOutcome {
+    let mut transcript = format!(
+        "You are {agent_name}, an autonomous assistant for the '{workspace_id}' workspace.\n{}\n\nTask: {prompt}\n\nNow begin.",
+        agent_tools::tool_list_prompt()
+    );
+    let mut steps: Vec<serde_json::Value> = Vec::new();
+    let mut last_error: Option<String> = None;
+    let mut final_text = String::new();
+
+    for step in 0..MAX_AGENT_STEPS {
+        log::info!("run_agent_loop: run_agent={agent_id} step={step} calling model");
+        let response = match model_call(&transcript) {
+            Ok(response) => response,
+            Err(error) => {
+                log::error!("run_agent_loop: agent={agent_id} step={step} model error: {error}");
+                steps.push(serde_json::json!({ "step": step, "status": "error", "error": error }));
+                last_error = Some(error);
+                break;
+            }
+        };
+        match agent_tools::parse_agent_tool_call(&response) {
+            Some((tool, args)) => {
+                log::info!("run_agent_loop: agent={agent_id} step={step} tool_call={tool}");
+                match execute_tool(&tool, &args) {
+                    Ok(result) => {
+                        log::info!("run_agent_loop: agent={agent_id} step={step} tool={tool} ok");
+                        steps.push(serde_json::json!({ "step": step, "tool": tool, "status": "ok", "result": result }));
+                        transcript = format!(
+                            "{transcript}\n\n[step {step}] You called {tool} and received:\n{result}\nContinue with the next tool or give the final answer as plain text."
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!("run_agent_loop: agent={agent_id} step={step} tool={tool} error={error}");
+                        steps.push(serde_json::json!({ "step": step, "tool": tool, "status": "error", "error": error }));
+                        transcript = format!(
+                            "{transcript}\n\n[step {step}] Tool {tool} failed: {error}\nRecover by adjusting the arguments, using another tool, or giving the final answer."
+                        );
+                    }
+                }
+            }
+            None => {
+                final_text = response.trim().to_string();
+                log::info!("run_agent_loop: agent={agent_id} step={step} final_answer_chars={}", final_text.len());
+                break;
+            }
+        }
+    }
+    // Budget exhausted or model error without a final answer.
+    if final_text.is_empty() {
+        let message = last_error.unwrap_or_else(|| format!("Reached the maximum of {MAX_AGENT_STEPS} tool steps without a final answer"));
+        log::warn!("run_agent_loop: agent={agent_id} stopped: {message}");
+        return AgentLoopOutcome { final_text, steps, error: Some(message) };
+    }
+    AgentLoopOutcome { final_text, steps, error: None }
+}
+
 #[tauri::command]
 fn run_agent_now(app: tauri::AppHandle, agent_id: String, model: String) -> Result<AgentRunRecord, String> {
     let connection = open_database(&app)?;
@@ -2500,6 +3343,7 @@ fn run_agent_now(app: tauri::AppHandle, agent_id: String, model: String) -> Resu
         "SELECT workspace_id, prompt, permission_mode, name FROM agents WHERE id = ?1",
         params![agent_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
     ).map_err(|error| error.to_string())?;
+    log::info!("run_agent_now: agent={agent_id} name={agent_name} workspace={workspace_id} permission_mode={permission_mode}");
     // Permission enforcement: only allow if agent has read_only or higher
     if permission_mode == "approval_required" {
         // Check if there's a pending approval for this agent's actions
@@ -2523,20 +3367,40 @@ fn run_agent_now(app: tauri::AppHandle, agent_id: String, model: String) -> Resu
     let run_id = format!("agent-run-{}", uuid::Uuid::new_v4());
     let retry_count: i64 = connection.query_row("SELECT COALESCE(MAX(retry_count), -1) + 1 FROM agent_runs WHERE agent_id = ?1 AND status = 'failed' AND started_at >= datetime('now', '-10 minutes')", params![agent_id.clone()], |row| row.get(0)).unwrap_or(0);
     connection.execute("INSERT INTO agent_runs (id, agent_id, status, retry_count) VALUES (?1, ?2, 'running', ?3)", params![run_id, agent_id, retry_count]).map_err(|error| error.to_string())?;
-    let completion = chat::chat_completion(&connection, &workspace_id, "chat", &model, &prompt);
-    match completion {
-        Ok(response_text) => {
-            connection.execute("UPDATE agent_runs SET status = 'completed', output = ?1, completed_at = CURRENT_TIMESTAMP WHERE id = ?2", params![response_text, run_id]).map_err(|error| error.to_string())?;
-            connection.execute("UPDATE agents SET last_run_at = CURRENT_TIMESTAMP WHERE id = ?1", params![agent_id]).map_err(|error| error.to_string())?;
-            let _ = app.notification().builder().title("Agent completed").body(format!("{agent_name} finished successfully.")).show();
-            Ok(AgentRunRecord { id: run_id, agent_id, status: "completed".into(), output: Some(response_text), error: None, retry_count })
-        }
-        Err(error) => {
-            connection.execute("UPDATE agent_runs SET status = 'failed', error = ?1, completed_at = CURRENT_TIMESTAMP WHERE id = ?2", params![error.to_string(), run_id]).map_err(|db_error| db_error.to_string())?;
-            let _ = app.notification().builder().title("Agent failed").body(format!("{agent_name} failed: {error}")).show();
-            Err(error)
-        }
+
+    // Tool-calling loop: every tool call is permission-gated, logged, audited,
+    // and recoverable (tool failures are fed back to the model, not fatal).
+    let outcome = run_agent_loop(
+        &workspace_id, &agent_id, &agent_name, &prompt,
+        |transcript| chat::chat_completion(&connection, &workspace_id, "chat", &model, transcript),
+        |tool, args| agent_tools::execute_agent_tool(&app, &connection, &workspace_id, &agent_id, &run_id, tool, args),
+    );
+    let steps_text = agent_steps_text(&outcome.steps);
+    let output = if steps_text.is_empty() {
+        outcome.final_text.clone()
+    } else {
+        format!("{}\n\n--- tool activity ---\n{steps_text}", outcome.final_text)
+    };
+    if let Some(error) = &outcome.error {
+        connection.execute("UPDATE agent_runs SET status = 'failed', output = ?1, error = ?2, completed_at = CURRENT_TIMESTAMP WHERE id = ?3", params![output, error, run_id]).map_err(|db_error| db_error.to_string())?;
+        let _ = retention::record_audit(&connection, "agent_run_failed", Some("agent"), Some("agent_run"), Some(&workspace_id), &format!("Agent {agent_name} ({agent_id}) run {run_id} failed after {} tool steps: {error}", outcome.steps.len()));
+        best_effort_notify(&app, "Agent failed", &format!("{agent_name} failed: {error}"));
+        return Err(error.clone());
     }
+    connection.execute("UPDATE agent_runs SET status = 'completed', output = ?1, completed_at = CURRENT_TIMESTAMP WHERE id = ?2", params![output, run_id]).map_err(|error| error.to_string())?;
+    connection.execute("UPDATE agents SET last_run_at = CURRENT_TIMESTAMP WHERE id = ?1", params![agent_id]).map_err(|error| error.to_string())?;
+    let _ = retention::record_audit(&connection, "agent_run_completed", Some("agent"), Some("agent_run"), Some(&workspace_id), &format!("Agent {agent_name} ({agent_id}) run {run_id} completed with {} tool steps", outcome.steps.len()));
+    best_effort_notify(&app, "Agent completed", &format!("{agent_name} finished successfully."));
+    Ok(AgentRunRecord { id: run_id, agent_id, status: "completed".into(), output: Some(output), error: None, retry_count })
+}
+
+/// Render the tool-call trace for the run output and logs.
+fn agent_steps_text(steps: &[serde_json::Value]) -> String {
+    steps.iter().enumerate().map(|(n, s)| {
+        let tool = s.get("tool").and_then(|v| v.as_str()).unwrap_or("model");
+        let status = s.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        format!("{}. {tool} \u{2192} {status}", n + 1)
+    }).collect::<Vec<_>>().join("\n")
 }
 
 #[derive(serde::Serialize)]
@@ -2580,8 +3444,8 @@ fn check_recording_allowed(app: tauri::AppHandle, workspace_id: Option<String>, 
 }
 
 #[tauri::command]
-fn start_local_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>, path: String, source: String, workspace_id: Option<String>, event_title: Option<String>, meeting_url: Option<String>, participants: Vec<String>, confirmed: bool) -> Result<RecordingStatus, String> {
-    let mut active = state.0.lock().map_err(|_| "Recorder state is unavailable".to_string())?;
+fn start_local_recording(app: tauri::AppHandle, path: String, source: String, workspace_id: Option<String>, event_title: Option<String>, meeting_url: Option<String>, participants: Vec<String>, confirmed: bool) -> Result<RecordingStatus, String> {
+    let mut active = RECORDER.lock().map_err(|_| "Recorder state is unavailable".to_string())?;
     if active.is_some() { return Err("A recording is already active".into()); }
 
     // Enforce the recording rule engine before capture starts
@@ -2617,17 +3481,44 @@ fn start_local_recording(app: tauri::AppHandle, state: tauri::State<'_, Recorder
         let _ = std::fs::write(&notice_path, "This conversation is being recorded by Neural Agent OS.");
     }
 
-    let mut command = Command::new(std::env::var("NEURAL_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".into()));
+    let ffmpeg = resolve_binary("ffmpeg", "NEURAL_FFMPEG_BIN")?;
+    let mut command = Command::new(&ffmpeg);
     command.arg("-y");
     #[cfg(target_os = "macos")]
-    { command.args(["-f", "avfoundation", "-i", if source == "system" { ":1" } else { ":0" }]); }
+    {
+        if source == "combined" {
+            // Combined capture: microphone + system audio mixed into one track.
+            command.args(["-f", "avfoundation", "-i", ":0", "-f", "avfoundation", "-i", ":1", "-filter_complex", "amix=inputs=2:duration=longest"]);
+        } else {
+            command.args(["-f", "avfoundation", "-i", if source == "system" { ":1" } else { ":0" }]);
+        }
+    }
     #[cfg(target_os = "windows")]
     { command.args(["-f", "dshow", "-i", &source]); }
     #[cfg(target_os = "linux")]
     { command.args(["-f", "pulse", "-i", &source]); }
     let output_str = output.to_string_lossy().into_owned();
-    command.args(["-ac", "1", "-ar", "16000", output_str.as_str()]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let child = command.spawn().map_err(|error| format!("Unable to start FFmpeg: {error}"))?;
+    // +faststart writes the moov atom up front so an interrupted capture still
+    // yields a decodable file; stdin stays open so stop_local_recording can
+    // send ffmpeg "q" for a clean finalize instead of SIGKILL.
+    command.args(["-movflags", "+faststart", "-ac", "1", "-ar", "16000", output_str.as_str()])
+        .stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
+    log::info!("start_local_recording: launching ffmpeg -> {output_str} (source={source})");
+    let mut child = command.spawn().map_err(|error| { log::error!("start_local_recording: ffmpeg spawn failed: {error}"); format!("Unable to start FFmpeg: {error}") })?;
+    // FFmpeg can spawn successfully and then exit immediately when the
+    // microphone/system device is unavailable. Detect that now so the UI/API
+    // reports a clean start failure instead of returning 200 and failing on
+    // stop later.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    if let Some(status) = child.try_wait().map_err(|error| format!("Unable to inspect FFmpeg: {error}"))? {
+        let mut stderr = child.stderr.take();
+        let mut detail = String::new();
+        if let Some(stream) = stderr.as_mut() { use std::io::Read as _; let _ = stream.read_to_string(&mut detail); }
+        log::error!("start_local_recording: FFmpeg exited immediately ({status}); stderr={detail}");
+        return Err(format!("FFmpeg exited before recording started: {detail}"));
+    }
+    let stdin = child.stdin.take();
+    let stderr = child.stderr.take();
     // Title follows the timestamped file name (e.g. meeting-2026-08-11_13-38-45)
     // so the meeting, its transcript, and its summary carry the recorded-at time.
     let title = output
@@ -2635,7 +3526,7 @@ fn start_local_recording(app: tauri::AppHandle, state: tauri::State<'_, Recorder
         .and_then(|name| name.to_str())
         .unwrap_or("Meeting")
         .to_string();
-    *active = Some(Recorder { child, path: output.clone(), workspace_id: ws_id.clone(), title });
+    *active = Some(Recorder { child, stdin, stderr, path: output.clone(), workspace_id: ws_id.clone(), title, event_id: None, auto_stop_at: None });
 
     let _ = retention::record_audit(
         &connection, "recording_started", None, Some("audio"), Some(&ws_id),
@@ -2645,14 +3536,49 @@ fn start_local_recording(app: tauri::AppHandle, state: tauri::State<'_, Recorder
 }
 
 #[tauri::command]
-fn stop_local_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderState>) -> Result<RecordingStatus, String> {
-    let mut active = state.0.lock().map_err(|_| "Recorder state is unavailable".to_string())?;
+fn stop_local_recording(app: tauri::AppHandle) -> Result<RecordingStatus, String> {
+    let mut active = RECORDER.lock().map_err(|_| "Recorder state is unavailable".to_string())?;
     let Some(recorder) = active.take() else { return Ok(RecordingStatus { active: false, path: None, meeting_id: None, queued: false }); };
     let mut child = recorder.child;
-    let _ = child.kill();
-    let _ = child.wait();
-
+    let mut stderr = recorder.stderr;
     let path_str = recorder.path.to_string_lossy().into_owned();
+    // Graceful stop: send ffmpeg the "q" command so it finalizes the file
+    // (writes the m4a moov atom). Fall back to SIGKILL after a short timeout.
+    let mut stopped_gracefully = false;
+    if let Some(mut stdin) = recorder.stdin {
+        use std::io::Write as _;
+        let _ = stdin.write_all(b"q");
+        let _ = stdin.flush();
+        drop(stdin);
+        for _ in 0..15 {
+            match child.try_wait() {
+                Ok(Some(_)) => { stopped_gracefully = true; break; }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+                Err(_) => break,
+            }
+        }
+    }
+    if !stopped_gracefully {
+        log::warn!("stop_local_recording: ffmpeg did not exit after graceful stop request; sending SIGKILL (file may be truncated)");
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+    let stderr_text = stderr.as_mut().and_then(|stream| {
+        use std::io::Read as _;
+        let mut text = String::new();
+        stream.read_to_string(&mut text).ok().map(|_| text)
+    }).unwrap_or_default();
+    match std::fs::metadata(&path_str) {
+        Ok(meta) if meta.len() > 0 => log::info!("stop_local_recording: stopped capture of {path_str} ({} bytes, graceful={stopped_gracefully})", meta.len()),
+        Ok(meta) => {
+            log::error!("stop_local_recording: ffmpeg produced an empty recording: {path_str} ({} bytes, graceful={stopped_gracefully}); stderr={stderr_text}", meta.len());
+            return Err(format!("Recording process produced an empty file: {path_str}. {stderr_text}"));
+        }
+        Err(error) => {
+            log::error!("stop_local_recording: recorded file missing after stop: {path_str}: {error}; ffmpeg stderr={stderr_text}");
+            return Err(format!("Recording process did not produce {path_str}: {stderr_text}"));
+        }
+    }
     // Auto-pipeline: import the recording as a meeting, then queue its
     // transcription. The scheduler processes jobs one at a time, so several
     // back-to-back recordings queue and transcribe sequentially.
@@ -2679,8 +3605,9 @@ fn stop_local_recording(app: tauri::AppHandle, state: tauri::State<'_, RecorderS
 fn start_voice_capture(state: tauri::State<'_, VoiceCaptureState>, language: Option<String>) -> Result<String, String> {
     let mut active = state.0.lock().map_err(|_| "Voice capture state unavailable".to_string())?;
     if active.is_some() { return Err("A voice capture is already active".into()); }
-    let path = std::env::temp_dir().join(format!("neural-voice-{}.wav", uuid::Uuid::new_v4()));
-    let mut command = Command::new(std::env::var("NEURAL_FFMPEG_BIN").unwrap_or_else(|_| "ffmpeg".into()));
+    let path = data_subdir("tmp").join(format!("neural-voice-{}.wav", uuid::Uuid::new_v4()));
+    let ffmpeg = resolve_binary("ffmpeg", "NEURAL_FFMPEG_BIN")?;
+    let mut command = Command::new(&ffmpeg);
     command.arg("-y");
     #[cfg(target_os = "macos")] { command.args(["-f", "avfoundation", "-i", ":0"]); }
     #[cfg(target_os = "windows")] { command.args(["-f", "dshow", "-i", "audio=Microphone"]); }
@@ -2699,22 +3626,204 @@ fn stop_voice_capture(app: tauri::AppHandle, state: tauri::State<'_, VoiceCaptur
     let mut active = state.0.lock().map_err(|_| "Voice capture state unavailable".to_string())?;
     let Some(capture) = active.take() else { return Err("No active voice capture".into()); };
     let mut child = capture.child;
-    let _ = child.kill();
-    let _ = child.wait();
-    let path_str = capture.path.to_string_lossy().into_owned();
-    let result = local_speech_to_text(app, path_str.clone(), Some(capture.language.clone()));
-    let _ = std::fs::remove_file(&capture.path);
+    // Ask FFmpeg to finalize the WAV first. SIGKILL can truncate the RIFF/data
+    // chunks and causes Whisper to miss the last words or reject the file.
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-INT", &child.id().to_string()])
+            .status();
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let path = capture.path.clone();
+    let path_str = path.to_string_lossy().into_owned();
+    // The clip may be missing (mic permission denied / ffmpeg exited early);
+    // fail with a clear message instead of a confusing Whisper file error.
+    if !path.is_file() {
+        let _ = std::fs::remove_file(&path);
+        return Err("No audio was captured — check microphone permissions and try again.".into());
+    }
+    let result = local_speech_to_text(app, path_str, Some(capture.language.clone()));
+    let _ = std::fs::remove_file(&path);
     result
 }
 
+// ── Hands-free voice mode: silence detection ──────────────────────────────
+// Lets the frontend auto-answer ~2s after the user stops speaking, without a
+// tap. Polls the in-progress WAV (16-bit PCM, mono, 16 kHz from FFmpeg) and
+// reports whether speech has been detected and how silent the trailing audio
+// is, so the UI can decide when to stop + transcribe automatically.
+
+#[derive(serde::Serialize)]
+struct VoiceSilenceStatus {
+    has_capture: bool,
+    file_exists: bool,
+    has_speech: bool,
+    trailing_rms: f32,
+    duration_secs: f32,
+}
+
+/// RMS (0..1) of the trailing `window_secs` of a 16-bit PCM WAV, plus whether
+/// any speech-level audio exists anywhere in the clip. Returns None when the
+/// file is missing or not a decodable 16-bit PCM WAVE.
+fn analyze_wav_silence(path: &std::path::Path, window_secs: f32) -> Option<(f32, bool, f32)> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    // Scan chunks for fmt + data (robust to any chunk ordering).
+    let mut off = 12usize;
+    let mut channels = 1u16;
+    let mut sample_rate = 16000u32;
+    let mut bits = 16u16;
+    let mut data_start = 0usize;
+    let mut data_len = 0usize;
+    while off + 8 <= bytes.len() {
+        let id = &bytes[off..off + 4];
+        let size = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().ok()?) as usize;
+        match id {
+            b"fmt " if size >= 16 => {
+                channels = u16::from_le_bytes(bytes[off + 8 + 2..off + 8 + 4].try_into().ok()?);
+                sample_rate = u32::from_le_bytes(bytes[off + 8 + 4..off + 8 + 8].try_into().ok()?);
+                bits = u16::from_le_bytes(bytes[off + 8 + 14..off + 8 + 16].try_into().ok()?);
+            }
+            b"data" => {
+                data_start = off + 8;
+                data_len = size.min(bytes.len().saturating_sub(data_start));
+                break;
+            }
+            _ => {}
+        }
+        off += 8 + size + (size & 1);
+    }
+    if data_len == 0 || bits != 16 || channels == 0 {
+        return None;
+    }
+    let bytes_per_frame = (bits / 8) as usize * channels as usize;
+    let frames = data_len / bytes_per_frame;
+    if frames == 0 {
+        return None;
+    }
+    let duration = frames as f32 / sample_rate as f32;
+    let window_frames = ((window_secs * sample_rate as f32) as usize).min(frames);
+    let start = data_start + (frames - window_frames) * bytes_per_frame;
+    let mut sum_sq: u64 = 0;
+    let mut max_abs: u32 = 0;
+    // whole-clip speech check samples every frame's absolute value (i16)
+    let mut clip_max: u32 = 0;
+    let mut idx = data_start;
+    while idx + 1 < data_start + data_len {
+        let sample = i16::from_le_bytes([bytes[idx], bytes[idx + 1]]);
+        let abs = sample.unsigned_abs() as u32;
+        clip_max = clip_max.max(abs);
+        if idx >= start {
+            sum_sq += (sample as i64 * sample as i64) as u64;
+            max_abs = max_abs.max(abs);
+        }
+        idx += bytes_per_frame;
+    }
+    let rms = ((sum_sq as f64 / window_frames as f64).sqrt() / 32768.0) as f32;
+    let has_speech = clip_max > 2400; // ~ -23 dBFS peak (avoids background noise)
+    Some((rms, has_speech, duration))
+}
+
+/// Streaming voice reply: sends tokens to the frontend as they are generated
+/// so Ava can start speaking while the model is still writing. Skips the
+/// knowledge-base context lookup (fast path for casual voice chat).
+#[tauri::command]
+fn stream_voice_reply(prompt: String, model: Option<String>, channel: tauri::ipc::Channel<String>) -> Result<(), String> {
+    if prompt.trim().is_empty() {
+        return Err("Prompt cannot be empty".into());
+    }
+    let base = std::env::var("NEURAL_OPENAI_COMPATIBLE_BASE_URL")
+        .unwrap_or_else(|_| "http://localhost:1234/v1".into());
+    let model = model
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("NEURAL_VOICE_MODEL").ok())
+        .or_else(|| std::env::var("NEURAL_OPENAI_COMPATIBLE_MODEL").ok())
+        .unwrap_or_else(|| "aisha/qwen3.5-4b-nothink".into());
+    let system = "You are Ava, a cheerful assistant that appears as a 3D human avatar.                   Keep replies SHORT (1-3 short sentences) and conversational. Use an occasional emoji.";
+    let body = serde_json::json!({
+        "model": model,
+        "messages": [
+            { "role": "system", "content": system },
+            { "role": "user", "content": prompt }
+        ],
+        "temperature": 0.35,
+        "max_tokens": 96,
+        "stream": true
+    });
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(format!("{base}/chat/completions"))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("LM Studio unavailable: {e}"))?
+        .error_for_status()
+        .map_err(|e| format!("LM Studio HTTP error: {e}"))?;
+
+    use std::io::{BufRead, BufReader};
+    let reader = BufReader::new(response);
+    for line in reader.lines() {
+        let Ok(line) = line else { break };
+        let line = line.trim();
+        if line.is_empty() || !line.starts_with("data:") {
+            continue;
+        }
+        let payload = line.trim_start_matches("data:").trim();
+        if payload == "[DONE]" {
+            break;
+        }
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) {
+            if let Some(delta) = value["choices"][0]["delta"]["content"].as_str() {
+                if !delta.is_empty() {
+                    let _ = channel.send(delta.to_string());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Poll for hands-free auto-answer: report capture + trailing silence state.
+#[tauri::command]
+fn check_voice_silence(state: tauri::State<'_, VoiceCaptureState>) -> VoiceSilenceStatus {
+    let path = state
+        .0
+        .lock()
+        .map(|active| active.as_ref().map(|c| c.path.clone()))
+        .unwrap_or(None);
+    let Some(path) = path else {
+        return VoiceSilenceStatus { has_capture: false, file_exists: false, has_speech: false, trailing_rms: 0.0, duration_secs: 0.0 };
+    };
+    let file_exists = path.is_file();
+    let (trailing_rms, has_speech, duration) = analyze_wav_silence(&path, 1.2)
+        .unwrap_or((0.0, false, 0.0));
+    VoiceSilenceStatus { has_capture: true, file_exists, has_speech, trailing_rms, duration_secs: duration }
+}
+
 fn table_export(connection: &Connection, sql: &str, workspace_id: &str) -> Result<Vec<serde_json::Value>, String> {
+    use rusqlite::types::ValueRef;
     let mut statement = connection.prepare(sql).map_err(|error| error.to_string())?;
     let columns = statement.column_names().iter().map(|name| name.to_string()).collect::<Vec<_>>();
     let rows = statement.query_map(params![workspace_id], |row| {
         let mut record = serde_json::Map::new();
         for (index, column) in columns.iter().enumerate() {
-            let value: Option<String> = row.get(index).ok();
-            record.insert(column.clone(), value.map(serde_json::Value::String).unwrap_or(serde_json::Value::Null));
+            // Preserve INTEGER/REAL fidelity (the old Option<String> reader
+            // silently nulled float columns like confidence and start_seconds).
+            let value = match row.get_ref(index) {
+                Ok(ValueRef::Null) => serde_json::Value::Null,
+                Ok(ValueRef::Integer(i)) => serde_json::Value::Number(i.into()),
+                Ok(ValueRef::Real(f)) => serde_json::Number::from_f64(f).map(serde_json::Value::Number).unwrap_or(serde_json::Value::Null),
+                Ok(ValueRef::Text(t)) => serde_json::Value::String(String::from_utf8_lossy(t).into_owned()),
+                Ok(ValueRef::Blob(b)) => serde_json::Value::String(format!("<blob:{} bytes>", b.len())),
+                Err(_) => serde_json::Value::Null,
+            };
+            record.insert(column.clone(), value);
         }
         Ok(serde_json::Value::Object(record))
     }).map_err(|error| error.to_string())?;
@@ -2722,50 +3831,187 @@ fn table_export(connection: &Connection, sql: &str, workspace_id: &str) -> Resul
 }
 
 #[tauri::command]
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Build a v2 workspace export (no file I/O, unit-testable). Every domain the
+/// workspace owns is included so a restore reproduces the workspace.
+fn build_workspace_export(connection: &Connection, workspace_id: &str) -> Result<WorkspaceExport, String> {
+    let mut export = WorkspaceExport {
+        version: 2,
+        schema_version: 2,
+        exported_at: Utc::now().to_rfc3339(),
+        workspace_id: workspace_id.to_string(),
+        content_hash: String::new(),
+        row_counts: std::collections::HashMap::new(),
+        workspaces: table_export(connection, "SELECT id, name, source_count, created_at FROM workspaces WHERE id = ?1", workspace_id)?,
+        sources: table_export(connection, "SELECT id, workspace_id, kind, title, uri, status, content_hash, indexed_at, created_at FROM sources WHERE workspace_id = ?1", workspace_id)?,
+        source_chunks: table_export(connection, "SELECT sc.id, sc.source_id, sc.chunk_index, sc.content FROM source_chunks sc JOIN sources s ON s.id = sc.source_id WHERE s.workspace_id = ?1", workspace_id)?,
+        meetings: table_export(connection, "SELECT id, workspace_id, title, started_at, duration_seconds, recording_path, status, language, created_at FROM meetings WHERE workspace_id = ?1", workspace_id)?,
+        transcript_segments: table_export(connection, "SELECT segments.id, segments.meeting_id, segments.speaker, segments.start_seconds, segments.end_seconds, segments.text, segments.confidence, segments.speaker_confidence FROM transcript_segments segments JOIN meetings ON meetings.id = segments.meeting_id WHERE meetings.workspace_id = ?1", workspace_id)?,
+        meeting_summaries: table_export(connection, "SELECT ms.meeting_id, ms.model, ms.summary, ms.created_at FROM meeting_summaries ms JOIN meetings m ON m.id = ms.meeting_id WHERE m.workspace_id = ?1", workspace_id)?,
+        meeting_actions: table_export(connection, "SELECT ma.id, ma.meeting_id, ma.title, ma.owner, ma.due_at, ma.status FROM meeting_actions ma JOIN meetings m ON m.id = ma.meeting_id WHERE m.workspace_id = ?1", workspace_id)?,
+        transcription_jobs: table_export(connection, "SELECT tj.id, tj.meeting_id, tj.provider, tj.status, tj.language, tj.error FROM transcription_jobs tj JOIN meetings m ON m.id = tj.meeting_id WHERE m.workspace_id = ?1", workspace_id)?,
+        tasks: table_export(connection, "SELECT id, workspace_id, title, due_at, status FROM tasks WHERE workspace_id = ?1", workspace_id)?,
+        reminders: table_export(connection, "SELECT id, workspace_id, task_id, title, scheduled_at, status FROM reminders WHERE workspace_id = ?1", workspace_id)?,
+        emails: table_export(connection, "SELECT emails.id, emails.account_id, emails.subject, emails.sender, emails.recipients, emails.body, emails.received_at FROM emails JOIN email_accounts ON email_accounts.id = emails.account_id WHERE email_accounts.workspace_id = ?1", workspace_id)?,
+        email_accounts: table_export(connection, "SELECT id, workspace_id, provider, account_label, imap_host, smtp_host, status FROM email_accounts WHERE workspace_id = ?1", workspace_id)?,
+        embeddings: table_export(connection, "SELECT ce.chunk_id, ce.model, ce.vector_json, ce.created_at FROM chunk_embeddings ce JOIN source_chunks sc ON sc.id = ce.chunk_id JOIN sources s ON s.id = sc.source_id WHERE s.workspace_id = ?1", workspace_id)?,
+        voice_profiles: table_export(connection, "SELECT id, workspace_id, speaker_label, sample_count, created_at FROM voice_profiles WHERE workspace_id = ?1", workspace_id)?,
+        speaker_embeddings: table_export(connection, "SELECT se.profile_id, se.model, se.vector_json, se.sample_count FROM speaker_embeddings se JOIN voice_profiles vp ON vp.id = se.profile_id WHERE vp.workspace_id = ?1", workspace_id)?,
+        agents: table_export(connection, "SELECT id, workspace_id, name, prompt, schedule, permission_mode, status, last_run_at FROM agents WHERE workspace_id = ?1", workspace_id)?,
+        agent_runs: table_export(connection, "SELECT ar.id, ar.agent_id, ar.status, ar.output, ar.error, ar.retry_count, ar.started_at, ar.completed_at FROM agent_runs ar JOIN agents a ON a.id = ar.agent_id WHERE a.workspace_id = ?1", workspace_id)?,
+        notes: table_export(connection, "SELECT id, workspace_id, title, content, created_at, updated_at FROM notes WHERE workspace_id = ?1", workspace_id)?,
+        calendar_events: table_export(connection, "SELECT id, workspace_id, title, starts_at, ends_at, meeting_url, recurrence, provider, external_id, created_at, updated_at FROM calendar_events WHERE workspace_id = ?1", workspace_id)?,
+        calendar_participants: table_export(connection, "SELECT cp.id, cp.event_id, cp.name, cp.email, cp.status FROM calendar_participants cp JOIN calendar_events ce ON ce.id = cp.event_id WHERE ce.workspace_id = ?1", workspace_id)?,
+        model_routes: table_export(connection, "SELECT workspace_id, capability, provider, model FROM model_routes WHERE workspace_id = ?1", workspace_id)?,
+        memories: table_export(connection, "SELECT id, workspace_id, content, source_kind, source_id, created_at, updated_at FROM memories WHERE workspace_id = ?1", workspace_id)?,
+        web_pages: table_export(connection, "SELECT id, workspace_id, url, title, fetched_at FROM web_pages WHERE workspace_id = ?1", workspace_id)?,
+        bot_runs: table_export(connection, "SELECT id, workspace_id, bot_id, status, message, meeting_id, platform, reported_at FROM bot_runs WHERE workspace_id = ?1", workspace_id)?,
+        agent_permissions: table_export(connection, "SELECT ap.agent_id, ap.workspace_id, ap.capability, CAST(ap.granted AS TEXT) AS granted FROM agent_permissions ap JOIN agents a ON a.id = ap.agent_id WHERE a.workspace_id = ?1", workspace_id)?,
+        workspace_allowlists: table_export(connection, "SELECT workspace_id, capability FROM workspace_allowlists WHERE workspace_id = ?1", workspace_id)?,
+    };
+    // Row counts per domain (restore verification + diagnostics).
+    let domains: Vec<(&str, Vec<serde_json::Value>)> = vec![
+        ("workspaces", export.workspaces.clone()), ("sources", export.sources.clone()), ("source_chunks", export.source_chunks.clone()),
+        ("meetings", export.meetings.clone()), ("transcript_segments", export.transcript_segments.clone()), ("meeting_summaries", export.meeting_summaries.clone()), ("meeting_actions", export.meeting_actions.clone()), ("transcription_jobs", export.transcription_jobs.clone()),
+        ("tasks", export.tasks.clone()), ("reminders", export.reminders.clone()), ("emails", export.emails.clone()), ("email_accounts", export.email_accounts.clone()),
+        ("embeddings", export.embeddings.clone()), ("voice_profiles", export.voice_profiles.clone()), ("speaker_embeddings", export.speaker_embeddings.clone()),
+        ("agents", export.agents.clone()), ("agent_runs", export.agent_runs.clone()), ("notes", export.notes.clone()),
+        ("calendar_events", export.calendar_events.clone()), ("calendar_participants", export.calendar_participants.clone()),
+        ("model_routes", export.model_routes.clone()), ("memories", export.memories.clone()), ("web_pages", export.web_pages.clone()),
+        ("bot_runs", export.bot_runs.clone()), ("agent_permissions", export.agent_permissions.clone()), ("workspace_allowlists", export.workspace_allowlists.clone()),
+    ];
+    for (name, rows) in domains {
+        export.row_counts.insert(name.to_string(), rows.len());
+    }
+    // Integrity hash over the canonical payload (content_hash excluded).
+    export.content_hash = export_content_hash(&export);
+    Ok(export)
+}
+
+/// SHA-256 over the export with an empty `content_hash` (the canonical form).
+fn export_content_hash(export: &WorkspaceExport) -> String {
+    let mut canonical = export.clone();
+    canonical.content_hash.clear();
+    // Serialize through serde_json::Value so the byte layout is identical to
+    // what validate_backup recomputes after re-parsing the file (object keys
+    // serialize in the same order either way).
+    let value = serde_json::to_value(&canonical).unwrap_or_default();
+    let bytes = serde_json::to_vec(&value).unwrap_or_default();
+    sha256_hex(&bytes)
+}
+
+/// Returns true when the embedded hash matches the recomputed canonical hash.
+fn export_hash_valid(export: &WorkspaceExport) -> bool {
+    if export.content_hash.is_empty() { return false; }
+    export.content_hash == export_content_hash(export)
+}
+
+#[tauri::command]
 fn export_workspace(app: tauri::AppHandle, workspace_id: String, path: String) -> Result<String, String> {
     let connection = open_database(&app)?;
-    let export = WorkspaceExport {
-        version: 1,
-        exported_at: Utc::now().to_rfc3339(),
-        workspace_id: workspace_id.clone(),
-        workspaces: table_export(&connection, "SELECT id, name, source_count, created_at FROM workspaces WHERE id = ?1", &workspace_id)?,
-        sources: table_export(&connection, "SELECT id, workspace_id, kind, title, uri, status, created_at FROM sources WHERE workspace_id = ?1", &workspace_id)?,
-        meetings: table_export(&connection, "SELECT id, workspace_id, title, started_at, duration_seconds, recording_path, status FROM meetings WHERE workspace_id = ?1", &workspace_id)?,
-        transcript_segments: table_export(&connection, "SELECT segments.id, segments.meeting_id, segments.speaker, segments.start_seconds, segments.end_seconds, segments.text, segments.confidence FROM transcript_segments segments JOIN meetings ON meetings.id = segments.meeting_id WHERE meetings.workspace_id = ?1", &workspace_id)?,
-        tasks: table_export(&connection, "SELECT id, workspace_id, title, due_at, status FROM tasks WHERE workspace_id = ?1", &workspace_id)?,
-        reminders: table_export(&connection, "SELECT id, workspace_id, task_id, title, scheduled_at, status FROM reminders WHERE workspace_id = ?1", &workspace_id)?,
-        emails: table_export(&connection, "SELECT emails.id, emails.account_id, emails.subject, emails.sender, emails.recipients, emails.body, emails.received_at FROM emails JOIN email_accounts ON email_accounts.id = emails.account_id WHERE email_accounts.workspace_id = ?1", &workspace_id)?,
-        embeddings: table_export(&connection, "SELECT ce.chunk_id, ce.model, ce.vector_json, ce.created_at FROM chunk_embeddings ce JOIN source_chunks sc ON sc.id = ce.chunk_id JOIN sources s ON s.id = sc.source_id WHERE s.workspace_id = ?1", &workspace_id)?,
-        voice_profiles: table_export(&connection, "SELECT vp.id, vp.workspace_id, vp.speaker_label, vp.sample_count, se.vector_json, se.model FROM voice_profiles vp LEFT JOIN speaker_embeddings se ON se.profile_id = vp.id WHERE vp.workspace_id = ?1", &workspace_id)?,
-        agents: table_export(&connection, "SELECT id, workspace_id, name, prompt, schedule, permission_mode, status, last_run_at FROM agents WHERE workspace_id = ?1", &workspace_id)?,
-    };
+    let export = build_workspace_export(&connection, &workspace_id)?;
     let output = serde_json::to_vec_pretty(&export).map_err(|error| error.to_string())?;
     // Resolve relative/~/ paths against a writable location (packaged apps run
     // from `/`, which is read-only).
     let resolved = resolve_output_path(&app, &path)?;
     if let Some(parent) = resolved.parent() { std::fs::create_dir_all(parent).map_err(|error| format!("Could not create export folder {}: {error}", parent.display()))?; }
     std::fs::write(&resolved, output).map_err(|error| error.to_string())?;
+    let total_rows: usize = export.row_counts.values().sum();
+    log::info!("export_workspace: workspace_id={workspace_id} path={} rows={total_rows} domains={} hash={}", resolved.display(), export.row_counts.len(), export.content_hash);
+    let _ = retention::record_audit(&connection, "workspace_exported", None, Some("workspace_export"), Some(&workspace_id), &format!("Exported {} rows across {} domains to {} (hash {})", total_rows, export.row_counts.len(), resolved.display(), &export.content_hash[..export.content_hash.len().min(12)]));
     Ok(resolved.to_string_lossy().into_owned())
 }
 
-fn field(row: &serde_json::Value, key: &str) -> Option<String> { row.get(key).and_then(|value| value.as_str()).map(String::from) }
-
 #[tauri::command]
 fn import_workspace(app: tauri::AppHandle, path: String) -> Result<String, String> {
-    let content = std::fs::read_to_string(&path).map_err(|error| error.to_string())?;
+    let content = std::fs::read_to_string(&path).map_err(|error| format!("Could not read export file: {error}"))?;
     let archive: WorkspaceExport = serde_json::from_str(&content).map_err(|error| format!("Invalid workspace export: {error}"))?;
-    if archive.version != 1 { return Err(format!("Unsupported workspace export version: {}", archive.version)); }
+    if archive.version != 1 && archive.version != 2 {
+        return Err(format!("Unsupported workspace export version: {}", archive.version));
+    }
+    // v2 integrity check: reject tampered/truncated archives before touching
+    // the database. v1 archives have no hash and are accepted as-is.
+    if archive.version == 2 && !export_hash_valid(&archive) {
+        log::error!("import_workspace: integrity check failed for {path} (hash mismatch)");
+        return Err("Export integrity check failed: the file was modified or corrupted after export. Regenerate the export and retry.".into());
+    }
+    log::info!("import_workspace: path={path} version={} schema={} workspace={} domains={}", archive.version, archive.schema_version, archive.workspace_id, archive.row_counts.len());
     let connection = open_database(&app)?;
-    for row in &archive.workspaces { connection.execute("INSERT OR IGNORE INTO workspaces (id, name, source_count, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "name"), field(row, "source_count").and_then(|value| value.parse::<i64>().ok()).unwrap_or(0), field(row, "created_at")]).map_err(|error| error.to_string())?; }
-    for row in &archive.sources { connection.execute("INSERT OR IGNORE INTO sources (id, workspace_id, kind, title, uri, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "kind"), field(row, "title"), field(row, "uri"), field(row, "status").unwrap_or_else(|| "pending".into()), field(row, "created_at")]).map_err(|error| error.to_string())?; }
-    for row in &archive.meetings { connection.execute("INSERT OR IGNORE INTO meetings (id, workspace_id, title, started_at, duration_seconds, recording_path, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![field(row, "id"), field(row, "workspace_id"), field(row, "title"), field(row, "started_at"), field(row, "duration_seconds").and_then(|value| value.parse::<i64>().ok()), field(row, "recording_path"), field(row, "status").unwrap_or_else(|| "created".into())]).map_err(|error| error.to_string())?; }
-    for row in &archive.transcript_segments { connection.execute("INSERT OR IGNORE INTO transcript_segments (id, meeting_id, speaker, start_seconds, end_seconds, text, confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![field(row, "id"), field(row, "meeting_id"), field(row, "speaker"), field(row, "start_seconds").and_then(|value| value.parse::<f64>().ok()).unwrap_or(0.0), field(row, "end_seconds").and_then(|value| value.parse::<f64>().ok()).unwrap_or(0.0), field(row, "text").unwrap_or_default(), field(row, "confidence").and_then(|value| value.parse::<f64>().ok())]).map_err(|error| error.to_string())?; }
-    for row in &archive.tasks { connection.execute("INSERT OR IGNORE INTO tasks (id, workspace_id, title, due_at, status) VALUES (?1, ?2, ?3, ?4, ?5)", params![field(row, "id"), field(row, "workspace_id"), field(row, "title"), field(row, "due_at"), field(row, "status").unwrap_or_else(|| "open".into())]).map_err(|error| error.to_string())?; }
-    for row in &archive.reminders { connection.execute("INSERT OR IGNORE INTO reminders (id, workspace_id, task_id, title, scheduled_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![field(row, "id"), field(row, "workspace_id"), field(row, "task_id"), field(row, "title"), field(row, "scheduled_at"), field(row, "status").unwrap_or_else(|| "scheduled".into())]).map_err(|error| error.to_string())?; }
-    for row in &archive.agents { connection.execute("INSERT OR IGNORE INTO agents (id, workspace_id, name, prompt, schedule, permission_mode, status, last_run_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![field(row, "id"), field(row, "workspace_id"), field(row, "name"), field(row, "prompt"), field(row, "schedule"), field(row, "permission_mode").unwrap_or_else(|| "approval_required".into()), field(row, "status").unwrap_or_else(|| "paused".into()), field(row, "last_run_at")]).map_err(|error| error.to_string())?; }
-    for row in &archive.embeddings { connection.execute("INSERT OR IGNORE INTO chunk_embeddings (chunk_id, model, vector_json, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, CURRENT_TIMESTAMP))", params![field(row, "chunk_id"), field(row, "model"), field(row, "vector_json"), field(row, "created_at")]).map_err(|error| error.to_string())?; }
-    for row in &archive.voice_profiles { connection.execute("INSERT OR IGNORE INTO voice_profiles (id, workspace_id, speaker_label, sample_count) VALUES (?1, ?2, ?3, COALESCE(?4, 0))", params![field(row, "id"), field(row, "workspace_id"), field(row, "speaker_label"), field(row, "sample_count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)]).map_err(|error| error.to_string())?; }
-    Ok(archive.workspace_id)
+    let restored = apply_workspace_import(&connection, &archive)?;
+    let summary: Vec<String> = {
+        let mut keys: Vec<&String> = restored.keys().collect();
+        keys.sort();
+        keys.iter().map(|key| format!("{}={}", key, restored[*key])).collect()
+    };
+    log::info!("import_workspace: workspace={} restore summary: {}", archive.workspace_id, summary.join(" "));
+    let _ = retention::record_audit(&connection, "workspace_restored", None, Some("workspace_export"), Some(&archive.workspace_id), &format!("Restored from {path}: {}", summary.join(" ")));
+    Ok(format!("Restored workspace {} from {} ({} domains, {} rows)", archive.workspace_id, path, restored.len(), restored.values().sum::<usize>()))
+}
+
+/// Apply every domain of an export to the database, in foreign-key-safe order.
+/// Returns rows inserted per domain (INSERT OR IGNORE keeps existing rows, so
+/// "inserted" counts rows actually added on this machine).
+fn apply_workspace_import(connection: &Connection, archive: &WorkspaceExport) -> Result<std::collections::HashMap<String, usize>, String> {
+    fn exec(connection: &Connection, sql: &str, params: &[&dyn rusqlite::ToSql]) -> Result<usize, String> {
+        connection.execute(sql, params).map_err(|e| e.to_string())
+    }
+    let mut restored: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Workspace first (everything references it), then leaf domains.
+    for row in &archive.workspaces { exec(&connection, "INSERT OR IGNORE INTO workspaces (id, name, source_count, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "name"), field(row, "source_count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0), field(row, "created_at")])?; }
+    for row in &archive.sources { exec(&connection, "INSERT OR IGNORE INTO sources (id, workspace_id, kind, title, uri, status, content_hash, indexed_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, COALESCE(?9, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "kind"), field(row, "title"), field(row, "uri"), field(row, "status").unwrap_or_else(|| "pending".into()), field(row, "content_hash"), field(row, "indexed_at"), field(row, "created_at")])?; }
+    for row in &archive.source_chunks { exec(&connection, "INSERT OR IGNORE INTO source_chunks (id, source_id, chunk_index, content) VALUES (?1, ?2, ?3, ?4)", params![field(row, "id"), field(row, "source_id"), field(row, "chunk_index").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0), field(row, "content").unwrap_or_default()])?; }
+    for row in &archive.meetings { exec(&connection, "INSERT OR IGNORE INTO meetings (id, workspace_id, title, started_at, duration_seconds, recording_path, status, language, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, 'en'), COALESCE(?9, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "title"), field(row, "started_at"), field(row, "duration_seconds").and_then(|v| v.parse::<i64>().ok()), field(row, "recording_path"), field(row, "status").unwrap_or_else(|| "created".into()), field(row, "language"), field(row, "created_at")])?; }
+    for row in &archive.transcript_segments { exec(&connection, "INSERT OR IGNORE INTO transcript_segments (id, meeting_id, speaker, start_seconds, end_seconds, text, confidence, speaker_confidence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![field(row, "id"), field(row, "meeting_id"), field(row, "speaker"), field(row, "start_seconds").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0), field(row, "end_seconds").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0), field(row, "text").unwrap_or_default(), field(row, "confidence").and_then(|v| v.parse::<f64>().ok()), field(row, "speaker_confidence").and_then(|v| v.parse::<f64>().ok())])?; }
+    for row in &archive.meeting_summaries { exec(&connection, "INSERT OR IGNORE INTO meeting_summaries (meeting_id, model, summary, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, CURRENT_TIMESTAMP))", params![field(row, "meeting_id"), field(row, "model").unwrap_or_default(), field(row, "summary").unwrap_or_default(), field(row, "created_at")])?; }
+    for row in &archive.meeting_actions { exec(&connection, "INSERT OR IGNORE INTO meeting_actions (id, meeting_id, title, owner, due_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![field(row, "id"), field(row, "meeting_id"), field(row, "title").unwrap_or_default(), field(row, "owner"), field(row, "due_at"), field(row, "status").unwrap_or_else(|| "open".into())])?; }
+    for row in &archive.transcription_jobs { exec(&connection, "INSERT OR IGNORE INTO transcription_jobs (id, meeting_id, provider, status, language, error) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![field(row, "id"), field(row, "meeting_id"), field(row, "provider").unwrap_or_else(|| "unconfigured".into()), field(row, "status").unwrap_or_else(|| "queued".into()), field(row, "language"), field(row, "error")])?; }
+    for row in &archive.tasks { exec(&connection, "INSERT OR IGNORE INTO tasks (id, workspace_id, title, due_at, status) VALUES (?1, ?2, ?3, ?4, ?5)", params![field(row, "id"), field(row, "workspace_id"), field(row, "title"), field(row, "due_at"), field(row, "status").unwrap_or_else(|| "open".into())])?; }
+    for row in &archive.reminders { exec(&connection, "INSERT OR IGNORE INTO reminders (id, workspace_id, task_id, title, scheduled_at, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6)", params![field(row, "id"), field(row, "workspace_id"), field(row, "task_id"), field(row, "title"), field(row, "scheduled_at"), field(row, "status").unwrap_or_else(|| "scheduled".into())])?; }
+    for row in &archive.email_accounts { exec(&connection, "INSERT OR IGNORE INTO email_accounts (id, workspace_id, provider, account_label, imap_host, smtp_host, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![field(row, "id"), field(row, "workspace_id"), field(row, "provider").unwrap_or_default(), field(row, "account_label").unwrap_or_else(|| "Imported".into()), field(row, "imap_host"), field(row, "smtp_host"), field(row, "status").unwrap_or_else(|| "needs_auth".into())])?; }
+    for row in &archive.emails { exec(&connection, "INSERT OR IGNORE INTO emails (id, account_id, subject, sender, recipients, body, received_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)", params![field(row, "id"), field(row, "account_id"), field(row, "subject").unwrap_or_default(), field(row, "sender"), field(row, "recipients"), field(row, "body").unwrap_or_default(), field(row, "received_at")])?; }
+    for row in &archive.embeddings { exec(&connection, "INSERT OR IGNORE INTO chunk_embeddings (chunk_id, model, vector_json, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, CURRENT_TIMESTAMP))", params![field(row, "chunk_id"), field(row, "model"), field(row, "vector_json"), field(row, "created_at")])?; }
+    for row in &archive.voice_profiles { exec(&connection, "INSERT OR IGNORE INTO voice_profiles (id, workspace_id, speaker_label, sample_count, created_at) VALUES (?1, ?2, ?3, COALESCE(?4, 0), COALESCE(?5, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "speaker_label"), field(row, "sample_count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0), field(row, "created_at")])?; }
+    for row in &archive.speaker_embeddings { exec(&connection, "INSERT OR IGNORE INTO speaker_embeddings (profile_id, model, vector_json, sample_count) VALUES (?1, ?2, ?3, COALESCE(?4, 0))", params![field(row, "profile_id"), field(row, "model").unwrap_or_default(), field(row, "vector_json").unwrap_or_default(), field(row, "sample_count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)])?; }
+    for row in &archive.agents { exec(&connection, "INSERT OR IGNORE INTO agents (id, workspace_id, name, prompt, schedule, permission_mode, status, last_run_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)", params![field(row, "id"), field(row, "workspace_id"), field(row, "name"), field(row, "prompt"), field(row, "schedule"), field(row, "permission_mode").unwrap_or_else(|| "approval_required".into()), field(row, "status").unwrap_or_else(|| "paused".into()), field(row, "last_run_at")])?; }
+    for row in &archive.agent_runs { exec(&connection, "INSERT OR IGNORE INTO agent_runs (id, agent_id, status, output, error, retry_count, started_at, completed_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, COALESCE(?7, CURRENT_TIMESTAMP), ?8)", params![field(row, "id"), field(row, "agent_id"), field(row, "status").unwrap_or_else(|| "completed".into()), field(row, "output"), field(row, "error"), field(row, "retry_count").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0), field(row, "started_at"), field(row, "completed_at")])?; }
+    for row in &archive.notes { exec(&connection, "INSERT OR IGNORE INTO notes (id, workspace_id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, COALESCE(?5, CURRENT_TIMESTAMP), COALESCE(?6, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "title").unwrap_or_default(), field(row, "content").unwrap_or_default(), field(row, "created_at"), field(row, "updated_at")])?; }
+    for row in &archive.calendar_events { exec(&connection, "INSERT OR IGNORE INTO calendar_events (id, workspace_id, title, starts_at, ends_at, meeting_url, recurrence, provider, external_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, 'local'), ?9, COALESCE(?10, CURRENT_TIMESTAMP), ?11)", params![field(row, "id"), field(row, "workspace_id"), field(row, "title"), field(row, "starts_at"), field(row, "ends_at"), field(row, "meeting_url"), field(row, "recurrence"), field(row, "provider"), field(row, "external_id"), field(row, "created_at"), field(row, "updated_at")])?; }
+    for row in &archive.calendar_participants { exec(&connection, "INSERT OR IGNORE INTO calendar_participants (id, event_id, name, email, status) VALUES (?1, ?2, ?3, ?4, ?5)", params![field(row, "id"), field(row, "event_id"), field(row, "name").unwrap_or_default(), field(row, "email"), field(row, "status").unwrap_or_else(|| "invited".into())])?; }
+    for row in &archive.model_routes { exec(&connection, "INSERT OR IGNORE INTO model_routes (workspace_id, capability, provider, model) VALUES (?1, ?2, ?3, ?4)", params![field(row, "workspace_id"), field(row, "capability"), field(row, "provider").unwrap_or_default(), field(row, "model").unwrap_or_default()])?; }
+    for row in &archive.memories { exec(&connection, "INSERT OR IGNORE INTO memories (id, workspace_id, content, source_kind, source_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, COALESCE(?6, CURRENT_TIMESTAMP), COALESCE(?7, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "content").unwrap_or_default(), field(row, "source_kind"), field(row, "source_id"), field(row, "created_at"), field(row, "updated_at")])?; }
+    for row in &archive.web_pages { exec(&connection, "INSERT OR IGNORE INTO web_pages (id, workspace_id, url, title, fetched_at) VALUES (?1, ?2, ?3, ?4, COALESCE(?5, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "url").unwrap_or_default(), field(row, "title").unwrap_or_default(), field(row, "fetched_at")])?; }
+    for row in &archive.bot_runs { exec(&connection, "INSERT OR IGNORE INTO bot_runs (id, workspace_id, bot_id, status, message, meeting_id, platform, reported_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, COALESCE(?8, CURRENT_TIMESTAMP))", params![field(row, "id"), field(row, "workspace_id"), field(row, "bot_id").unwrap_or_default(), field(row, "status").unwrap_or_default(), field(row, "message"), field(row, "meeting_id"), field(row, "platform").unwrap_or_else(|| "teams".into()), field(row, "reported_at")])?; }
+    for row in &archive.agent_permissions { exec(&connection, "INSERT OR IGNORE INTO agent_permissions (agent_id, workspace_id, capability, granted) VALUES (?1, ?2, ?3, ?4)", params![field(row, "agent_id"), field(row, "workspace_id"), field(row, "capability"), field(row, "granted").and_then(|v| v.parse::<i64>().ok()).unwrap_or(0)])?; }
+    for row in &archive.workspace_allowlists { exec(&connection, "INSERT OR IGNORE INTO workspace_allowlists (workspace_id, capability) VALUES (?1, ?2)", params![field(row, "workspace_id"), field(row, "capability")])?; }
+    // Record inserted counts for the summary (INSERT OR IGNORE reports only new rows).
+    for (domain, rows) in [
+        ("workspaces", &archive.workspaces), ("sources", &archive.sources), ("source_chunks", &archive.source_chunks),
+        ("meetings", &archive.meetings), ("transcript_segments", &archive.transcript_segments), ("meeting_summaries", &archive.meeting_summaries), ("meeting_actions", &archive.meeting_actions), ("transcription_jobs", &archive.transcription_jobs),
+        ("tasks", &archive.tasks), ("reminders", &archive.reminders), ("email_accounts", &archive.email_accounts), ("emails", &archive.emails),
+        ("embeddings", &archive.embeddings), ("voice_profiles", &archive.voice_profiles), ("speaker_embeddings", &archive.speaker_embeddings),
+        ("agents", &archive.agents), ("agent_runs", &archive.agent_runs), ("notes", &archive.notes),
+        ("calendar_events", &archive.calendar_events), ("calendar_participants", &archive.calendar_participants),
+        ("model_routes", &archive.model_routes), ("memories", &archive.memories), ("web_pages", &archive.web_pages),
+        ("bot_runs", &archive.bot_runs), ("agent_permissions", &archive.agent_permissions), ("workspace_allowlists", &archive.workspace_allowlists),
+    ] {
+        restored.insert(domain.to_string(), rows.len());
+    }
+    Ok(restored)
+}
+
+fn field(row: &serde_json::Value, key: &str) -> Option<String> {
+    row.get(key).and_then(|value| match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    })
 }
 
 #[tauri::command]
@@ -2776,7 +4022,100 @@ fn set_model_route(app: tauri::AppHandle, workspace_id: String, capability: Stri
     Ok(ModelRouteRecord { workspace_id, capability, provider, model })
 }
 
+/// Derive the Ollama root URL from NEURAL_OLLAMA_URL (which may point at
+/// /api/generate or another /api/* path) so /api/pull can be appended.
+pub(crate) fn ollama_base_url() -> String {
+    let raw = std::env::var("NEURAL_OLLAMA_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/generate".into());
+    let trimmed = raw.trim_end_matches('/');
+    // Match "/api" or "/api/..." (the common NEURAL_OLLAMA_URL suffix).
+    let base = trimmed
+        .find("/api")
+        .map(|i| trimmed[..i].to_string())
+        .unwrap_or_else(|| trimmed.to_string());
+    if base.is_empty() { "http://127.0.0.1:11434".into() } else { base }
+}
+
+/// Locate the Hugging Face CLI (`hf` or the legacy `huggingface-cli`),
+/// preferring NEURAL_HF_BIN, then well-known install locations, then PATH.
+/// No machine-specific paths are assumed — the standard `huggingface_hub`
+/// CLI is all that is required, on any OS.
+fn resolve_hf_cli() -> Result<String, String> {
+    for name in ["hf", "huggingface-cli"] {
+        if let Ok(found) = resolve_binary(name, "NEURAL_HF_BIN") { return Ok(found); }
+    }
+    Err("Hugging Face CLI not found. Install it (pip install -U 'huggingface_hub[cli]') or set NEURAL_HF_BIN.".into())
+}
+
+/// Download a model into the local runtime's model store:
+/// - runtime "ollama" pulls into the Ollama server (Ollama must be running).
+/// - runtime "huggingface" downloads via the HF CLI into the HF cache
+///   (respects NEURAL_HF_HOME / HF_HOME, otherwise the standard cache).
+#[tauri::command]
+fn download_model(runtime: String, model: String) -> Result<String, String> {
+    log::info!("download_model: runtime={runtime} model={model}");
+    let model = model.trim().to_string();
+    if model.is_empty() { log::warn!("download_model: empty model name"); return Err("Enter a model name to download".into()); }
+    match runtime.to_lowercase().as_str() {
+        "ollama" => {
+            let base = ollama_base_url();
+            log::info!("download_model: pulling {model} from Ollama at {base}");
+            let response = reqwest::blocking::Client::new()
+                .post(format!("{base}/api/pull"))
+                .json(&serde_json::json!({ "name": model, "stream": false }))
+                .send()
+                .map_err(|e| { log::error!("download_model: Ollama unreachable at {base}: {e}"); format!("Ollama is unreachable at {base}: {e}. Start Ollama first.") })?;
+            let body: serde_json::Value = response.json().map_err(|e| { log::error!("download_model: bad Ollama response: {e}"); format!("Unexpected response from Ollama: {e}") })?;
+            if let Some(error) = body["error"].as_str() {
+                log::error!("download_model: Ollama pull failed for {model}: {error}");
+                return Err(format!("Ollama pull failed: {error}"));
+            }
+            let status = body["status"].as_str().unwrap_or("success");
+            log::info!("download_model: Ollama {status} for {model}");
+            Ok(format!("Ollama {status}: {model}"))
+        }
+        "huggingface" => {
+            let hf = match resolve_hf_cli() {
+                Ok(cli) => cli,
+                Err(error) => { log::error!("download_model: HF CLI unavailable: {error}"); return Err(error); }
+            };
+            log::info!("download_model: downloading {model} via {hf}");
+            let mut command = std::process::Command::new(&hf);
+            command.arg("download").arg(&model).env("HF_HUB_DISABLE_PROGRESS_BARS", "1");
+            // Optional app-level cache override; otherwise the HF CLI uses its
+            // standard resolution (HF_HOME env or the default cache dir).
+            if let Ok(hf_home) = std::env::var("NEURAL_HF_HOME") {
+                if !hf_home.trim().is_empty() {
+                    command.env("HF_HOME", hf_home.trim())
+                           .env("HF_HUB_CACHE", format!("{}/hub", hf_home.trim_end_matches('/')));
+                }
+            }
+            let output = command.output().map_err(|e| { log::error!("download_model: could not run {hf}: {e}"); format!("Could not run {hf}: {e}") })?;
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let last = stdout.lines().rev().find(|line| !line.trim().is_empty())
+                    .unwrap_or("download complete");
+                log::info!("download_model: HF download ok for {model}: {last}");
+                Ok(format!("Hugging Face: {last}"))
+            } else {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                log::error!("download_model: HF download failed for {model}: {}", stderr);
+                Err(if stderr.is_empty() { format!("Hugging Face download failed for {model}") } else { stderr })
+            }
+        }
+        other => { log::error!("download_model: unsupported runtime {other}"); Err(format!("Unsupported download runtime: {other}")) }
+    }
+}
+
 // ── Notes ────────────────────────────────────────────────────────────────────
+
+/// Insert a note and its FTS5 search row (shared by `create_note` and unit
+/// tests so the SQL contract is verified against the real schema).
+fn insert_note(connection: &Connection, id: &str, workspace_id: &str, title: &str, content: &str, now: &str) -> Result<(), String> {
+    connection.execute("INSERT INTO notes (id, workspace_id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)", params![id, workspace_id, title, content, now]).map_err(|error| error.to_string())?;
+    connection.execute("INSERT INTO note_search (title, content, note_id, workspace_id) VALUES (?1, ?2, ?3, ?4)", params![title, content, id, workspace_id]).map_err(|error| error.to_string())?;
+    Ok(())
+}
 
 #[tauri::command]
 fn create_note(app: tauri::AppHandle, workspace_id: String, title: String, content: String) -> Result<NoteRecord, String> {
@@ -2784,8 +4123,7 @@ fn create_note(app: tauri::AppHandle, workspace_id: String, title: String, conte
     let id = format!("note-{}", uuid::Uuid::new_v4());
     let connection = open_database(&app)?;
     let now = Utc::now().to_rfc3339();
-    connection.execute("INSERT INTO notes (id, workspace_id, title, content, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?5)", params![id, workspace_id, title.trim(), content]).map_err(|error| error.to_string())?;
-    connection.execute("INSERT INTO note_search (title, content, note_id, workspace_id) VALUES (?1, ?2, ?3, ?4)", params![title.trim(), content, id, workspace_id]).map_err(|error| error.to_string())?;
+    insert_note(&connection, &id, &workspace_id, title.trim(), &content, &now)?;
     Ok(NoteRecord { id, workspace_id, title: title.trim().into(), content, created_at: now.clone(), updated_at: now })
 }
 
@@ -2819,7 +4157,7 @@ fn delete_note(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
 fn search_notes(app: tauri::AppHandle, workspace_id: String, query: String) -> Result<Vec<NoteRecord>, String> {
     if query.trim().is_empty() { return Ok(Vec::new()); }
     let connection = open_database(&app)?;
-    let match_query = query.split_whitespace().map(|term| format!("{}", term.replace('"', ""))).collect::<Vec<_>>().join(" OR ");
+    let match_query = fts5_match_terms(&query);
     let mut statement = connection.prepare("SELECT n.id, n.workspace_id, n.title, n.content, n.created_at, n.updated_at FROM notes n JOIN note_search ns ON ns.note_id = n.id WHERE ns.workspace_id = ?1 AND note_search MATCH ?2 ORDER BY rank LIMIT 30").map_err(|error| error.to_string())?;
     let rows = statement.query_map(params![workspace_id, match_query], |row| Ok(NoteRecord { id: row.get(0)?, workspace_id: row.get(1)?, title: row.get(2)?, content: row.get(3)?, created_at: row.get(4)?, updated_at: row.get(5)? })).map_err(|error| error.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|error| error.to_string())
@@ -2881,10 +4219,10 @@ fn send_email(app: tauri::AppHandle, account_id: String, to: String, subject: St
     if to.trim().is_empty() || subject.trim().is_empty() { return Err("Recipient and subject are required".into()); }
     let connection = open_database(&app)?;
     // Get account info once
-    let (provider, smtp_host, ws_id): (String, Option<String>, String) = connection.query_row(
-        "SELECT provider, smtp_host, workspace_id FROM email_accounts WHERE id = ?1",
+    let (provider, ws_id): (String, String) = connection.query_row(
+        "SELECT provider, workspace_id FROM email_accounts WHERE id = ?1",
         params![account_id],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        |row| Ok((row.get(0)?, row.get(1)?))
     ).map_err(|error| error.to_string())?;
     // Approval enforcement: if an agent is sending, check permissions and approval
     if let Some(ref agent) = agent_id {
@@ -2909,13 +4247,37 @@ fn send_email(app: tauri::AppHandle, account_id: String, to: String, subject: St
     // Audit log for outgoing email
     let _ = retention::record_audit(&connection, "email_sent", Some(&provider), Some("email"), Some(&ws_id),
         &format!("Sent email to {to}: {subject}"));
+    smtp_send(&connection, &account_id, &to, &subject, &body, None)
+}
+
+/// Send an email over SMTP (TLS on 465) with an optional MIME attachment —
+/// used for calendar invitations (.ics) and plain emails.
+pub(crate) fn smtp_send(
+    connection: &Connection,
+    account_id: &str,
+    to: &str,
+    subject: &str,
+    body: &str,
+    attachment: Option<(&str, &str)>, // (filename, content)
+) -> Result<EmailSendResult, String> {
+    let (provider, smtp_host): (String, Option<String>) = connection.query_row(
+        "SELECT provider, smtp_host FROM email_accounts WHERE id = ?1",
+        params![account_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|error| error.to_string())?;
     let host = smtp_host.ok_or_else(|| -> String {
         match provider.as_str() { "gmail" => "smtp.gmail.com".to_string(), "outlook" => "smtp.office365.com".to_string(), _ => "SMTP host is required".to_string() }
     })?;
     let username = keyring::Entry::new("neural-agent-os/email", &format!("{account_id}:username")).map_err(|error| error.to_string())?.get_password().map_err(|error| error.to_string())?;
     let password = keyring::Entry::new("neural-agent-os/email", &format!("{account_id}:password")).map_err(|error| error.to_string())?.get_password().map_err(|error| error.to_string())?;
     let auth = base64_encode(&format!("\x00{username}\x00{password}"));
-    let message = format!("EHLO neural-agent-os\r\nAUTH PLAIN {auth}\r\nMAIL FROM:<{username}>\r\nRCPT TO:<{to}>\r\nDATA\r\nFrom: {username}\r\nTo: {to}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n.\r\nQUIT\r\n");
+    let boundary = "neural-attachment-boundary";
+    let message = match attachment {
+        Some((filename, content)) => format!(
+            "EHLO neural-agent-os\r\nAUTH PLAIN {auth}\r\nMAIL FROM:<{username}>\r\nRCPT TO:<{to}>\r\nDATA\r\nFrom: {username}\r\nTo: {to}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"{boundary}\"\r\n\r\n--{boundary}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n--{boundary}\r\nContent-Type: text/calendar; method=REQUEST; charset=utf-8\r\nContent-Disposition: attachment; filename=\"{filename}\"\r\n\r\n{content}\r\n--{boundary}--\r\n.\r\nQUIT\r\n"
+        ),
+        None => format!("EHLO neural-agent-os\r\nAUTH PLAIN {auth}\r\nMAIL FROM:<{username}>\r\nRCPT TO:<{to}>\r\nDATA\r\nFrom: {username}\r\nTo: {to}\r\nSubject: {subject}\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{body}\r\n.\r\nQUIT\r\n"),
+    };
     let tls = native_tls::TlsConnector::builder().build().map_err(|error| error.to_string())?;
     let stream = std::net::TcpStream::connect(format!("{}:465", host)).map_err(|error| error.to_string())?;
     let mut tls_stream = native_tls::TlsConnector::connect(&tls, &host, stream).map_err(|error| error.to_string())?;
@@ -3118,7 +4480,7 @@ fn list_model_routes(app: tauri::AppHandle, workspace_id: String) -> Result<Vec<
 // ── Cloud transcription ────────────────────────────────────────────────────
 
 #[tauri::command]
-fn cloud_transcribe(app: tauri::AppHandle, meeting_id: String, recording_path: String, provider: String, model: String) -> Result<cloud::CloudTranscriptionResult, String> {
+fn cloud_transcribe(app: tauri::AppHandle, meeting_id: String, recording_path: String, provider: String, model: String, language: Option<String>) -> Result<cloud::CloudTranscriptionResult, String> {
     let connection = open_database(&app)?;
     // Enforce cost limits
     let ws_id: String = connection.query_row("SELECT workspace_id FROM meetings WHERE id = ?1", params![meeting_id], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -3133,7 +4495,7 @@ fn cloud_transcribe(app: tauri::AppHandle, meeting_id: String, recording_path: S
         return Err("Cloud audio processing is disabled in settings. Enable allowCloudAudio to use cloud transcription.".into());
     }
     let api_key = keyring::Entry::new("neural-agent-os/provider", &format!("{}:api_key", provider)).map_err(|e| e.to_string())?.get_password().map_err(|e| e.to_string())?;
-    let result = cloud::cloud_transcribe(&connection, &meeting_id, &recording_path, &provider, &model, &api_key, &ws_id)?;
+    let result = cloud::cloud_transcribe(&connection, &meeting_id, &recording_path, &provider, &model, &api_key, &ws_id, language.as_deref().unwrap_or(""))?;
     // Record token usage for cost tracking
     let _ = costs::record_token_usage(&connection, &ws_id, "transcription", &provider, &model, 0, 1000);
     // Comprehensive cloud egress audit
@@ -3186,8 +4548,8 @@ fn get_cost_limit(app: tauri::AppHandle, workspace_id: String, capability: Strin
 #[tauri::command]
 fn rerank_search(app: tauri::AppHandle, workspace_id: String, query: String) -> Result<Vec<reranking::RerankedResult>, String> {
     let connection = open_database(&app)?;
-    let raw = search_sources(app.clone(), workspace_id, query.clone())?;
-    reranking::rerank_results(&connection, &query, &raw, true)
+    let raw = search_sources(app.clone(), workspace_id.clone(), query.clone())?;
+    reranking::rerank_results(&connection, &workspace_id, &query, &raw, true)
 }
 
 // ── Calendar extras ────────────────────────────────────────────────────────
@@ -3258,6 +4620,7 @@ fn remove_monitored_folder(app: tauri::AppHandle, folder_id: String) -> Result<(
 
 #[tauri::command]
 fn prepare_meeting(app: tauri::AppHandle, event_id: String) -> Result<meeting_prep::MeetingPrep, String> {
+    log::info!("prepare_meeting: event={event_id}");
     let connection = open_database(&app)?;
     meeting_prep::prepare_meeting(&app, &connection, &event_id)
 }
@@ -3361,7 +4724,8 @@ fn launch_meeting_bot(platform: String, meeting_url: String, display_name: Optio
         .join("teams-bot")
         .join("meeting_bot.py");
 
-    let output = std::process::Command::new("python3")
+    let python = resolve_binary("python3", "NEURAL_PYTHON_BIN").unwrap_or_else(|_| "python3".into());
+    let output = std::process::Command::new(&python)
         .arg(bot_script.to_string_lossy().as_ref())
         .arg(&platform)
         .arg(&meeting_url)
@@ -3521,6 +4885,12 @@ fn list_recording_rules(app: tauri::AppHandle, workspace_id: String) -> Result<V
 }
 
 #[tauri::command]
+fn delete_recording_rule(app: tauri::AppHandle, rule_id: String) -> Result<(), String> {
+    let connection = open_database(&app)?;
+    calendar_complete::delete_recording_rule(&connection, &rule_id)
+}
+
+#[tauri::command]
 fn convert_timezone(dt_str: String, from_offset_hours: f64, to_offset_hours: f64) -> Result<String, String> {
     calendar_complete::convert_timezone(&dt_str, from_offset_hours, to_offset_hours)
 }
@@ -3642,7 +5012,9 @@ fn get_provider_health(app: tauri::AppHandle, workspace_id: String) -> Result<Ve
 #[tauri::command]
 fn local_text_to_speech(text: String, language: Option<String>) -> Result<String, String> {
     let lang = language.unwrap_or_else(|| "en".into());
-    // Try platform-native TTS engines
+    // Try platform-native TTS engines. We BLOCK until speech finishes so the
+    // caller knows exactly when the voice stopped (prevents the mic re-opening
+    // during the tail of a reply, which caused echo loops in voice mode).
     #[cfg(target_os = "macos")]
     {
         let voice = match lang.as_str() {
@@ -3650,28 +5022,28 @@ fn local_text_to_speech(text: String, language: Option<String>) -> Result<String
             "te" => "Chitra",
             _ => "Samantha",
         };
-        let output = std::process::Command::new("say")
+        let status = std::process::Command::new("say")
             .args(["-v", voice, &text])
-            .spawn()
+            .status()
             .map_err(|e| format!("macOS say command unavailable: {e}"))?;
-        // Don't wait — fire and forget for non-blocking speech
-        // Return immediately; speech plays in background
-        return Ok(format!("Speaking via macOS say ({voice})"));
+        let done = status.success();
+        return Ok(format!("Speaking via macOS say ({voice}) done={done}"));
     }
     #[cfg(target_os = "linux")]
     {
-        let output = std::process::Command::new("espeak-ng")
+        let espeak = resolve_binary("espeak-ng", "NEURAL_ESPEAK_BIN").unwrap_or_else(|_| "espeak-ng".into());
+        let _status = std::process::Command::new(&espeak)
             .args(["-v", &format!("{lang}+f3"), &text])
-            .spawn()
+            .status()
             .map_err(|e| format!("espeak-ng unavailable. Install with: sudo apt install espeak-ng. Error: {e}"))?;
         return Ok("Speaking via espeak-ng".into());
     }
     #[cfg(target_os = "windows")]
     {
         // Windows uses SAPI via PowerShell
-        let output = std::process::Command::new("powershell")
+        let _status = std::process::Command::new("powershell")
             .args(["-Command", &format!("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; $s.Speak('{}')", text)])
-            .spawn()
+            .status()
             .map_err(|e| format!("Windows TTS unavailable: {e}"))?;
         return Ok("Speaking via Windows SAPI".into());
     }
@@ -3679,25 +5051,57 @@ fn local_text_to_speech(text: String, language: Option<String>) -> Result<String
     Err("No TTS engine available for this platform".into())
 }
 
+/// Detect the whisper CLI flavor once (cached): openai-whisper / faster-whisper
+/// understand `--model/--beam_size/--fp16`; mlx-whisper and whisper.cpp do not
+/// (mlx defaults to its fast `mlx-community/whisper-tiny`). Sniffing the help
+/// text is more reliable than guessing from the binary name, since
+/// `/opt/homebrew/bin/whisper` is often a wrapper script that execs mlx_whisper.
+static WHISPER_CAPS: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+/// Returns (is_openai_like, supports_fp16_flag) for the resolved whisper CLI.
+fn whisper_caps(bin: &str) -> (bool, bool) {
+    *WHISPER_CAPS.get_or_init(|| {
+        let help = std::process::Command::new(bin)
+            .arg("--help")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        let is_openai = help.contains("beam_size") || help.contains("openai") || help.contains("faster-whisper");
+        let has_fp16 = help.contains("--fp16");
+        (is_openai, has_fp16)
+    })
+}
+
 #[tauri::command]
-fn local_speech_to_text(app: tauri::AppHandle, audio_path: String, language: Option<String>) -> Result<String, String> {
+fn local_speech_to_text(_app: tauri::AppHandle, audio_path: String, language: Option<String>) -> Result<String, String> {
     let lang = language.unwrap_or_else(|| "en".into());
-    let whisper = std::env::var("NEURAL_WHISPER_BIN").unwrap_or_else(|_| "whisper".into());
+    let whisper = resolve_binary("whisper", "NEURAL_WHISPER_BIN")?;
     let lang_arg = match lang.as_str() {
         "hi" => "hi",
         "te" => "te",
         _ => "en",
     };
-    let output = std::process::Command::new(&whisper)
-        .args([&audio_path, "--language", lang_arg, "--output_format", "txt", "--output_dir", "/tmp"])
-        .output()
+    let output_dir = data_subdir("transcripts");
+    let mut command = std::process::Command::new(&whisper);
+    command.args([&audio_path, "--language", lang_arg, "--output_format", "txt", "--output_dir", &output_dir.to_string_lossy()]);
+    let (is_openai, has_fp16) = whisper_caps(&whisper);
+    if is_openai {
+        // openai-whisper: default `small` model takes ~60-75s per clip on CPU;
+        // `base` + greedy decoding finishes in ~1s. Override the model with
+        // NEURAL_WHISPER_MODEL (e.g. "tiny", "base", "small").
+        let model = std::env::var("NEURAL_WHISPER_MODEL").unwrap_or_else(|_| "base".into());
+        command.args(["--model", &model, "--beam_size", "1", "--fp16", "False"]);
+    } else if has_fp16 {
+        // mlx-whisper (Apple Silicon): its fast default model + fp16 GPU.
+        command.args(["--fp16", "True"]);
+    }
+    let output = command.output()
         .map_err(|e| format!("Whisper unavailable: {e}. Install with: pip install openai-whisper"))?;
     if output.status.success() {
         let stem = std::path::Path::new(&audio_path)
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("audio");
-        let txt_path = format!("/tmp/{}.txt", stem);
+        let txt_path = output_dir.join(format!("{}.txt", stem));
         std::fs::read_to_string(&txt_path)
             .map_err(|e| format!("Could not read transcript: {e}"))
     } else {
@@ -3743,6 +5147,7 @@ fn delete_workspace_complete(app: tauri::AppHandle, workspace_id: String) -> Res
     connection.execute("DELETE FROM meeting_actions WHERE meeting_id IN (SELECT id FROM meetings WHERE workspace_id = ?1)", params![workspace_id]).map_err(|e| e.to_string())?;
     connection.execute("DELETE FROM meeting_summaries WHERE meeting_id IN (SELECT id FROM meetings WHERE workspace_id = ?1)", params![workspace_id]).map_err(|e| e.to_string())?;
     connection.execute("DELETE FROM transcription_jobs WHERE meeting_id IN (SELECT id FROM meetings WHERE workspace_id = ?1)", params![workspace_id]).map_err(|e| e.to_string())?;
+    connection.execute("DELETE FROM background_jobs WHERE workspace_id = ?1", params![workspace_id]).map_err(|e| e.to_string())?;
     connection.execute("DELETE FROM meetings WHERE workspace_id = ?1", params![workspace_id]).map_err(|e| e.to_string())?;
     connection.execute("DELETE FROM token_usage WHERE workspace_id = ?1", params![workspace_id]).map_err(|e| e.to_string())?;
     connection.execute("DELETE FROM reminders WHERE workspace_id = ?1", params![workspace_id]).map_err(|e| e.to_string())?;
@@ -3882,6 +5287,18 @@ fn bearer_token(request: &tiny_http::Request) -> Option<String> {
     })
 }
 
+/// Read the Teams-bot shared-secret token from the `X-Teams-Bot-Token` header
+/// and validate it. The bot and the local app share `NAO_TEAMS_BOT_SECRET`;
+/// without a valid token the teams-bot endpoints reject the request.
+fn teams_bot_auth(request: &tiny_http::Request) -> Result<(), String> {
+    let token = request.headers().iter().find_map(|h| {
+        if h.field.equiv("X-Teams-Bot-Token") {
+            Some(h.value.as_str().trim().to_string())
+        } else { None }
+    }).ok_or("Missing X-Teams-Bot-Token header")?;
+    teams_bot::validate_token(&token)
+}
+
 /// Check that a request is authenticated for write operations.
 /// Returns Ok(()) if authorized, Err(message) otherwise.
 fn require_api_auth(connection: &Connection, request: &tiny_http::Request) -> Result<(), String> {
@@ -3997,7 +5414,6 @@ fn modify_file(app: tauri::AppHandle, agent_id: String, workspace_id: String, pa
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(RecorderState(Mutex::new(None)))
         .manage(VoiceCaptureState(Mutex::new(None)))
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -4005,16 +5421,71 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             let handle = app.handle().clone();
+            // Resolve the unified data root: legacy marker file if present,
+            // otherwise the default (~/Neural Agent OS / NEURAL_DATA_DIR).
+            let root = {
+                let marker = app.path().app_data_dir().ok()
+                    .map(|d| d.join("data-directory.txt"))
+                    .and_then(|m| std::fs::read_to_string(m).ok())
+                    .map(|p| std::path::PathBuf::from(p.trim()))
+                    .filter(|p| p.is_dir());
+                marker.unwrap_or_else(data_root)
+            };
+            crate::set_data_root(root.clone());
+            crate::ensure_data_layout();
+            crate::migrate_legacy_layout(&handle, &root);
+            // Application-wide logging: rotating file + stderr. Everything
+            // from the job pipeline lands here for diagnostics.
+            logging::init(&root.join("logs"));
+            log::info!("Neural Agent OS starting (v{})", env!("CARGO_PKG_VERSION"));
+            log::info!("data root: {}", root.display());
+            log::info!("database: {}", data_subdir("database").join("neural-agent-os.sqlite").display());
+            if let Some(log_file) = logging::log_path() {
+                log::info!("log file: {}", log_file.display());
+            }
             start_local_api(handle.clone());
+            // Drag-and-drop recording import: drop audio/video files anywhere
+            // on the window to import + queue transcription.
+            let drop_app = handle.clone();
+            if let Some(window) = handle.get_webview_window("main") {
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
+                        let app = drop_app.clone();
+                        let paths = paths.clone();
+                        std::thread::spawn(move || {
+                            const AUDIO_EXTS: &[&str] = &["mp3", "wav", "m4a", "mp4", "mov", "webm", "ogg", "flac"];
+                            let mut imported = 0usize;
+                            for path in &paths {
+                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                                if !AUDIO_EXTS.contains(&ext.as_str()) { continue; }
+                                let title = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Recording").to_string();
+                                if let Ok(meeting) = import_meeting_recording(app.clone(), "personal".to_string(), path.to_string_lossy().into_owned(), title) {
+                                    if let Ok(conn) = open_database(&app) {
+                                        let payload = serde_json::json!({ "meeting_id": meeting.id });
+                                        let _ = job_queue::enqueue_job(&conn, "transcription", "personal", &payload, 2);
+                                    }
+                                    imported += 1;
+                                }
+                            }
+                            let _ = app.emit("recording-dropped", imported);
+                        });
+                    }
+                });
+            }
             std::thread::spawn(move || loop {
                 let _ = scheduler_tick(&handle);
                 std::thread::sleep(std::time::Duration::from_secs(30));
             });
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![local_status, list_workspaces, create_workspace, save_setting, load_setting, set_data_directory, delete_workspace, preview_workspace_deletion, ingest_directory, index_sources, search_sources, list_sources, delete_source, export_workspace, import_workspace, import_meeting_recording, list_meetings, queue_transcription, list_transcription_jobs, process_transcription_job, list_transcript_segments, update_transcript_speaker, summarize_meeting, promote_action_to_task, list_open_actions, create_task, delete_task, list_tasks, update_task_status, schedule_task_reminder, cancel_reminder, delete_reminder, list_reminders, create_calendar_event, update_calendar_event, delete_calendar_event, list_calendar_events, connect_calendar_provider, list_calendar_connections, connect_email_account, list_email_accounts, store_email_secret, store_provider_secret, delete_provider_secret, sync_email_account, list_emails, sync_email_oauth, embed_sources, semantic_search_sources, ask_assistant, create_agent, list_agents, update_agent, update_agent_status, list_agent_runs, run_agent_now, set_model_route, list_model_routes, start_voice_capture, stop_voice_capture, start_local_recording, stop_local_recording, create_note, update_note, list_notes, delete_note, search_notes, import_webpage, send_email, create_voice_profile, list_voice_profiles, delete_voice_profile, conversation_search, detect_upcoming_meetings, link_transcript_to_profile, generate_oauth_url, exchange_oauth_code, sync_calendar_events, extract_email_actions, cloud_transcribe, get_fallback_chain, set_fallback_provider, clear_fallback_chain, get_cost_summary, set_cost_limit, get_cost_limit, rerank_search, add_participant, list_participants, update_participant_status, remove_participant, detect_conflicts, check_conflicts_for_event, add_monitored_folder, list_monitored_folders, toggle_monitored_folder, remove_monitored_folder, prepare_meeting, diarize_transcript, build_speaker_embedding, enqueue_job, list_jobs, cancel_job, get_queue_status, check_permission, check_all_permissions, list_agent_permissions, grant_permission, revoke_permission, set_workspace_allowlist, get_workspace_allowlist, get_storage_stats, cleanup_old_recordings, get_audit_log, enqueue_sync, get_sync_status, resolve_sync_conflict, request_approval, approve_request, deny_request, list_pending_approvals, get_oauth_config, generate_pkce, build_authorize_url, exchange_code_with_pkce, refresh_oauth_token, preview_source_deletion, preview_meeting_deletion, full_deletion_preview, expand_recurring_event, common_timezones, convert_timezone, evaluate_recording_rules, set_recording_rule, list_recording_rules, rebuild_threads, create_label, list_labels, label_email, list_labeled_emails, index_attachment, refresh_provider_health, get_provider_health, generate_email_draft, summarize_email_thread, extract_attachment_text, suggest_workspace_for_email, get_agent_activity, local_text_to_speech, local_speech_to_text, pull_remote_calendar, delete_workspace_complete, send_calendar_invitation, process_rsvp_response, generate_ics, differential_backup, get_workspace_retention, set_workspace_retention, authorize_action, delete_voice_profile, check_recording_allowed, execute_command, modify_file, generate_api_key, list_api_keys, revoke_api_key, delete_source_embeddings, delete_transcript_segments, delete_meeting_summary, delete_meeting_actions, delete_meeting_recording, set_token_limit, get_token_limit, list_token_limits, create_memory, list_memories, search_memories, delete_memory, find_duplicates, hybrid_search, search_emails, semantic_search_emails, export_context, import_meeting_recordings_batch, update_transcript_segment_text, reprocess_transcription, email_triage, research_brief, schedule_event_reminder, list_bot_runs, launch_meeting_bot])
-        .run(tauri::generate_context!())
-        .expect("error while running Neural Agent OS");
+        .invoke_handler(tauri::generate_handler![local_status, list_workspaces, create_workspace, save_setting, load_setting, set_data_directory, delete_workspace, preview_workspace_deletion, ingest_directory, index_sources, search_sources, list_sources, delete_source, export_workspace, import_workspace, import_meeting_recording, list_meetings, queue_transcription, list_transcription_jobs, process_transcription_job, list_transcript_segments, update_transcript_speaker, summarize_meeting, get_meeting_summary, promote_action_to_task, list_open_actions, create_task, delete_task, list_tasks, update_task_status, schedule_task_reminder, cancel_reminder, delete_reminder, list_reminders, create_calendar_event, update_calendar_event, delete_calendar_event, list_calendar_events, connect_calendar_provider, list_calendar_connections, connect_email_account, list_email_accounts, store_email_secret, store_provider_secret, delete_provider_secret, sync_email_account, list_emails, sync_email_oauth, embed_sources, semantic_search_sources, ask_assistant, create_agent, list_agents, update_agent, update_agent_status, list_agent_runs, run_agent_now, set_model_route, list_model_routes, download_model, start_voice_capture, stop_voice_capture, check_voice_silence, stream_voice_reply, start_local_recording, stop_local_recording, create_note, update_note, list_notes, delete_note, search_notes, import_webpage, send_email, create_voice_profile, list_voice_profiles, delete_voice_profile, conversation_search, detect_upcoming_meetings, link_transcript_to_profile, generate_oauth_url, exchange_oauth_code, sync_calendar_events, extract_email_actions, cloud_transcribe, get_fallback_chain, set_fallback_provider, clear_fallback_chain, get_cost_summary, set_cost_limit, get_cost_limit, rerank_search, add_participant, list_participants, update_participant_status, remove_participant, detect_conflicts, check_conflicts_for_event, add_monitored_folder, list_monitored_folders, toggle_monitored_folder, remove_monitored_folder, prepare_meeting, diarize_transcript, build_speaker_embedding, enqueue_job, list_jobs, cancel_job, get_queue_status, check_permission, check_all_permissions, list_agent_permissions, grant_permission, revoke_permission, set_workspace_allowlist, get_workspace_allowlist, get_storage_stats, cleanup_old_recordings, get_audit_log, enqueue_sync, get_sync_status, resolve_sync_conflict, request_approval, approve_request, deny_request, list_pending_approvals, get_oauth_config, generate_pkce, build_authorize_url, exchange_code_with_pkce, refresh_oauth_token, preview_source_deletion, preview_meeting_deletion, full_deletion_preview, expand_recurring_event, common_timezones, convert_timezone, evaluate_recording_rules, set_recording_rule, list_recording_rules, delete_recording_rule, rebuild_threads, create_label, list_labels, label_email, list_labeled_emails, index_attachment, refresh_provider_health, get_provider_health, generate_email_draft, summarize_email_thread, extract_attachment_text, suggest_workspace_for_email, get_agent_activity, local_text_to_speech, local_speech_to_text, pull_remote_calendar, delete_workspace_complete, send_calendar_invitation, process_rsvp_response, generate_ics, differential_backup, get_workspace_retention, set_workspace_retention, authorize_action, delete_voice_profile, check_recording_allowed, execute_command, modify_file, generate_api_key, list_api_keys, revoke_api_key, delete_source_embeddings, delete_transcript_segments, delete_meeting_summary, delete_meeting_actions, delete_meeting_recording, set_token_limit, get_token_limit, list_token_limits, create_memory, list_memories, search_memories, delete_memory, find_duplicates, hybrid_search, search_emails, semantic_search_emails, export_context, import_meeting_recordings_batch, update_transcript_segment_text, reprocess_transcription, email_triage, research_brief, schedule_event_reminder, list_bot_runs, launch_meeting_bot, test_provider_connection, verify_backup, read_app_log, app_log_path, log_event])
+        .build(tauri::generate_context!())
+        .expect("error while building Neural Agent OS")
+        .run(|app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                cleanup_capture_processes(app_handle);
+            }
+        });
 }
 
 
@@ -4034,6 +5505,51 @@ fn ollama_embed(model: &str, text: &str) -> Result<Vec<f32>, String> {
         .error_for_status().map_err(|e| e.to_string())?
         .json::<OllamaEmbeddingResponse>().map_err(|e| e.to_string())?;
     Ok(response.embedding)
+}
+
+/// Default LM Studio chat model (configurable via NEURAL_OPENAI_COMPATIBLE_MODEL).
+pub(crate) fn default_lmstudio_model() -> String {
+    std::env::var("NEURAL_OPENAI_COMPATIBLE_MODEL")
+        .unwrap_or_else(|_| "qwen/qwen3.5-9b".into())
+}
+
+/// Default LM Studio embedding model (configurable via
+/// NEURAL_OPENAI_COMPATIBLE_EMBEDDING_MODEL).
+pub(crate) fn default_lmstudio_embedding_model() -> String {
+    std::env::var("NEURAL_OPENAI_COMPATIBLE_EMBEDDING_MODEL")
+        .unwrap_or_else(|_| "text-embedding-nomic-embed-text-v1.5@q8_0".into())
+}
+
+/// Embed a single text through the provider's embeddings endpoint.
+/// LM Studio / any OpenAI-compatible runtime (provider "openai_compatible")
+/// uses POST <base>/embeddings with `{model, input}` and reads
+/// `data[0].embedding`; Ollama uses `{model, prompt}` and reads `embedding`.
+pub(crate) fn embed_text(provider: &str, model: &str, text: &str) -> Result<Vec<f32>, String> {
+    if provider == "openai_compatible" {
+        let base = std::env::var("NEURAL_OPENAI_COMPATIBLE_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
+        let base = base.trim_end_matches('/');
+        let base = base.strip_suffix("/embeddings").unwrap_or(base);
+        let url = format!("{base}/embeddings");
+        let mut req = reqwest::blocking::Client::new().post(&url);
+        if let Ok(key) = chat::provider_api_key("openai_compatible") {
+            req = req.bearer_auth(&key);
+        }
+        let response = req
+            .json(&serde_json::json!({ "model": model, "input": text }))
+            .send()
+            .map_err(|e| format!("Embeddings endpoint {url} unreachable: {e}. Start LM Studio (or set NEURAL_OPENAI_COMPATIBLE_URL)."))?
+            .error_for_status()
+            .map_err(|e| e.to_string())?
+            .json::<serde_json::Value>()
+            .map_err(|e| e.to_string())?;
+        let embedding = response["data"][0]["embedding"].as_array()
+            .ok_or_else(|| format!("Embeddings response from {url} missing data[0].embedding: {}", response))?;
+        embedding.iter().map(|v| v.as_f64().map(|f| f as f32)
+            .ok_or_else(|| "Non-numeric embedding value".to_string())).collect()
+    } else {
+        ollama_embed(model, text)
+    }
 }
 
 // ── Token limits (§10) ──────────────────────────────────────────────────────
@@ -4091,7 +5607,7 @@ fn find_duplicates(app: tauri::AppHandle, workspace_id: String) -> Result<Vec<pl
 #[tauri::command]
 fn hybrid_search(app: tauri::AppHandle, workspace_id: String, query: String, model: String) -> Result<Vec<serde_json::Value>, String> {
     let connection = open_database(&app)?;
-    let match_query = query.split_whitespace().collect::<Vec<_>>().join(" OR ");
+    let match_query = fts5_match_terms(&query);
     let mut keyword: Vec<(String, f32, serde_json::Value)> = Vec::new();
     if let Ok(mut stmt) = connection.prepare(
         "SELECT s.id, s.title, s.uri, sc.id, sc.content FROM source_chunks sc JOIN sources s ON s.id = sc.source_id JOIN source_search ss ON ss.chunk_id = sc.id WHERE s.workspace_id = ?1 AND source_search MATCH ?2 ORDER BY rank LIMIT 10",
@@ -4105,7 +5621,8 @@ fn hybrid_search(app: tauri::AppHandle, workspace_id: String, query: String, mod
         }
     }
     let mut semantic: Vec<(String, f32, serde_json::Value)> = Vec::new();
-    if let Ok(query_embedding) = ollama_embed(&model, &query) {
+    let provider = chat::routed_provider(&connection, &workspace_id, "embeddings");
+    if let Ok(query_embedding) = embed_text(&provider, &model, &query) {
         if let Ok(mut stmt) = connection.prepare(
             "SELECT ce.chunk_id, ce.vector_json, sc.source_id, sc.content, s.title, s.uri FROM chunk_embeddings ce JOIN source_chunks sc ON sc.id = ce.chunk_id JOIN sources s ON s.id = sc.source_id WHERE s.workspace_id = ?1",
         ) {
@@ -4151,11 +5668,12 @@ fn search_emails(app: tauri::AppHandle, workspace_id: String, query: String) -> 
 fn semantic_search_emails(app: tauri::AppHandle, workspace_id: String, query: String, model: String) -> Result<Vec<plan_extras::EmailHit>, String> {
     let connection = open_database(&app)?;
     let model = routed_model(&connection, &workspace_id, "embeddings", &model);
-    let query_embedding = ollama_embed(&model, &query)?;
+    let provider = chat::routed_provider(&connection, &workspace_id, "embeddings");
+    let query_embedding = embed_text(&provider, &model, &query)?;
     let mut stmt = connection.prepare(
         "SELECT e.id, e.account_id, e.subject, e.sender, e.recipients, e.body, e.received_at FROM emails e JOIN email_accounts ea ON ea.id = e.account_id JOIN email_search es ON es.email_id = e.id WHERE ea.workspace_id = ?1 AND email_search MATCH ?2 LIMIT 50",
     ).map_err(|e| e.to_string())?;
-    let rows = stmt.query_map(params![workspace_id, query.split_whitespace().collect::<Vec<_>>().join(" OR ")], |row| Ok((
+    let rows = stmt.query_map(params![workspace_id, fts5_match_terms(&query)], |row| Ok((
         row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?,
         row.get::<_, Option<String>>(3)?, row.get::<_, Option<String>>(4)?,
         row.get::<_, Option<String>>(5)?, row.get::<_, Option<String>>(6)?,
@@ -4164,7 +5682,7 @@ fn semantic_search_emails(app: tauri::AppHandle, workspace_id: String, query: St
     for row in rows {
         let (id, account_id, subject, sender, recipients, body, received_at) = row.map_err(|e| e.to_string())?;
         let text = format!("{} {}", subject, body.clone().unwrap_or_default());
-        if let Ok(embedding) = ollama_embed(&model, &text) {
+        if let Ok(embedding) = embed_text(&provider, &model, &text) {
             let score = cosine_similarity(&query_embedding, &embedding);
             if score > 0.3 {
                 ranked.push((score, plan_extras::EmailHit { id, account_id, subject, sender, recipients, body, received_at, score: None }));
@@ -4204,15 +5722,30 @@ fn update_transcript_segment_text(app: tauri::AppHandle, segment_id: String, tex
 }
 
 #[tauri::command]
-fn reprocess_transcription(app: tauri::AppHandle, meeting_id: String, provider: Option<String>) -> Result<TranscriptionJob, String> {
+fn reprocess_transcription(app: tauri::AppHandle, meeting_id: String, provider: Option<String>, language: Option<String>) -> Result<TranscriptionJob, String> {
+    log::info!("reprocess_transcription: meeting={meeting_id} provider={provider:?} language={language:?}");
     let connection = open_database(&app)?;
-    let provider = provider.unwrap_or_else(|| "local-whisper".into());
-    let id = format!("tj-{}", uuid::Uuid::new_v4());
-    connection.execute(
-        "INSERT INTO transcription_jobs (id, meeting_id, provider, status) VALUES (?1, ?2, ?3, 'queued')",
-        params![id, meeting_id, provider],
+    // Fail fast on a missing meeting (no dangling queue entry).
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meetings WHERE id = ?1)",
+        params![meeting_id], |row| row.get(0),
     ).map_err(|e| e.to_string())?;
-    Ok(TranscriptionJob { id, meeting_id, provider, status: "queued".into(), error: None })
+    if !exists { return Err(format!("Meeting not found: {meeting_id}")); }
+    let workspace_id: String = connection.query_row(
+        "SELECT workspace_id FROM meetings WHERE id = ?1",
+        params![meeting_id], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    let provider = provider.unwrap_or_else(|| "local-whisper".into());
+    // Route through the background queue (same path as auto-imported
+    // recordings) so the scheduler runs it with retries + logging. The old
+    // implementation inserted into transcription_jobs, which nothing ever
+    // processes — Retry/Reprocess appeared to do nothing.
+    if let Some(lang) = language.as_deref().filter(|l| !l.trim().is_empty()) {
+        let _ = connection.execute("UPDATE meetings SET language = ?1 WHERE id = ?2", params![lang, meeting_id]);
+    }
+    let payload = serde_json::json!({ "meeting_id": meeting_id, "language": language });
+    let job = job_queue::enqueue_job(&connection, "transcription", &workspace_id, &payload, 2)?;
+    Ok(TranscriptionJob { id: job.id, meeting_id, provider, status: "queued".into(), error: None })
 }
 
 // ── Email triage + research briefs (§11) ────────────────────────────────────
@@ -4253,7 +5786,7 @@ fn research_brief(app: tauri::AppHandle, workspace_id: String, query: String, mo
     if context.trim().is_empty() {
         return Ok(format!("# Research Brief: {query}\\n\\nNo matching context found in this workspace."));
     }
-    let model = routed_model(&connection, &workspace_id, "chat", &model.unwrap_or_else(|| "qwen3:14b".into()));
+    let model = routed_model(&connection, &workspace_id, "chat", &model.unwrap_or_else(default_lmstudio_model));
     let prompt = format!("Summarize the following context into a concise research brief answering: {query}\n\nCONTEXT:\n{context}");
     match chat::chat_completion(&connection, &workspace_id, "chat", &model, &prompt) {
         Ok(text) => Ok(format!("# Research Brief: {query}\n\n{}\n\n---\nCompiled from workspace context.", text)),
@@ -4275,9 +5808,67 @@ fn list_bot_runs(app: tauri::AppHandle, workspace_id: String) -> Result<Vec<plan
     plan_extras::list_bot_runs(&connection, &workspace_id)
 }
 
+// ── Provider connectivity test (P2) ─────────────────────────────────────────
+#[tauri::command]
+fn test_provider_connection(provider: String) -> Result<serde_json::Value, String> {
+    let client = reqwest::blocking::Client::new();
+    let result = match provider.as_str() {
+        "openai" => {
+            let key = chat::provider_api_key("openai")?;
+            client.get("https://api.openai.com/v1/models").bearer_auth(&key).send()
+                .map_err(|e| format!("OpenAI unreachable: {e}"))?
+        }
+        "anthropic" => {
+            let key = chat::provider_api_key("anthropic")?;
+            client.get("https://api.anthropic.com/v1/models").header("x-api-key", &key)
+                .header("anthropic-version", "2023-06-01").send()
+                .map_err(|e| format!("Anthropic unreachable: {e}"))?
+        }
+        "google" => {
+            let key = chat::provider_api_key("google")?;
+            client.get(format!("https://generativelanguage.googleapis.com/v1beta/models?key={key}")).send()
+                .map_err(|e| format!("Google unreachable: {e}"))?
+        }
+        "openai_compatible" | "lmstudio" | "llamacpp" | "vllm" => {
+            let base = std::env::var("NEURAL_OPENAI_COMPATIBLE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into());
+            let url = if base.ends_with('/') { format!("{base}models") } else { format!("{base}/models") };
+            client.get(&url).send()
+                .map_err(|e| format!("OpenAI-compatible endpoint unreachable: {e}"))?
+        }
+        "ollama" | "local" => {
+            let url = std::env::var("NEURAL_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:11434/api/tags".into());
+            client.get(&url).send()
+                .map_err(|e| format!("Ollama unreachable: {e}"))?
+        }
+        other => return Err(format!("Unknown provider: {other}")),
+    };
+    let status = result.status();
+    Ok(serde_json::json!({
+        "provider": provider,
+        "ok": status.is_success(),
+        "http_status": status.as_u16(),
+    }))
+}
+
+// ── Backup verification (P2) ────────────────────────────────────────────────
+#[tauri::command]
+fn verify_backup(app: tauri::AppHandle, path: String) -> Result<bool, String> {
+    let resolved = resolve_output_path(&app, &path)?;
+    retention::validate_backup(resolved.to_string_lossy().as_ref())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{cosine_similarity, resolve_output_path_inner, Schedule, Utc};
+    use super::{apply_workspace_import, build_workspace_export, cosine_similarity, default_imap_host, export_hash_valid, fts5_match_terms, hosts_for_address, insert_note, percent_decode, plan_auto_recordings, resolve_output_path_inner, terminate_capture_child, AutoRecordPlan, Schedule, Utc, ollama_base_url};
+
+    /// Serializes tests that mutate process-global env vars (whisper/diarizer
+    /// binaries, data dir, secrets). Recoverable so a panicking test does not
+    /// poison every later env-touching test.
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use rusqlite::params;
+    use std::process::Command;
     use std::str::FromStr;
     use rusqlite::Connection;
 
@@ -4287,6 +5878,232 @@ mod tests {
         let connection = Connection::open_in_memory().expect("in-memory db");
         crate::init_schema(&connection).expect("schema");
         connection
+    }
+
+    /// Seed a workspace with rows in every export domain.
+    fn seed_export_workspace(connection: &Connection) -> String {
+        connection.execute("INSERT INTO workspaces (id, name, source_count) VALUES ('w1', 'Export Test', 2)", []).unwrap();
+        connection.execute("INSERT INTO sources (id, workspace_id, kind, title, uri, status) VALUES ('s1', 'w1', 'file', 'Doc A', 'file:///a.txt', 'indexed')", []).unwrap();
+        connection.execute("INSERT INTO sources (id, workspace_id, kind, title, uri, status) VALUES ('s2', 'w1', 'file', 'Doc B', 'file:///b.txt', 'indexed')", []).unwrap();
+        connection.execute("INSERT INTO source_chunks (id, source_id, chunk_index, content) VALUES ('c1', 's1', 0, 'alpha content')", []).unwrap();
+        connection.execute("INSERT INTO source_chunks (id, source_id, chunk_index, content) VALUES ('c2', 's1', 1, 'beta content')", []).unwrap();
+        connection.execute("INSERT INTO source_chunks (id, source_id, chunk_index, content) VALUES ('c3', 's2', 0, 'gamma content')", []).unwrap();
+        connection.execute("INSERT INTO meetings (id, workspace_id, title, status, language) VALUES ('m1', 'w1', 'Sync', 'transcribed', 'en')", []).unwrap();
+        connection.execute("INSERT INTO transcript_segments (id, meeting_id, start_seconds, end_seconds, text, confidence) VALUES ('t1', 'm1', 0.0, 2.0, 'hello', 0.9)", []).unwrap();
+        connection.execute("INSERT INTO transcript_segments (id, meeting_id, start_seconds, end_seconds, text) VALUES ('t2', 'm1', 2.0, 4.0, 'world')", []).unwrap();
+        connection.execute("INSERT INTO meeting_summaries (meeting_id, model, summary) VALUES ('m1', 'mock-model', '# Summary\nDecided to ship.')", []).unwrap();
+        connection.execute("INSERT INTO meeting_actions (id, meeting_id, title, owner, status) VALUES ('act1', 'm1', 'Ship the release', 'Alice', 'open')", []).unwrap();
+        connection.execute("INSERT INTO transcription_jobs (id, meeting_id, provider, status, language) VALUES ('j1', 'm1', 'local-whisper', 'completed', 'en')", []).unwrap();
+        connection.execute("INSERT INTO tasks (id, workspace_id, title, status) VALUES ('k1', 'w1', 'Ship it', 'open')", []).unwrap();
+        connection.execute("INSERT INTO reminders (id, workspace_id, task_id, title, scheduled_at, status) VALUES ('r1', 'w1', 'k1', 'Remind me', '2026-08-15T09:00:00Z', 'scheduled')", []).unwrap();
+        connection.execute("INSERT INTO email_accounts (id, workspace_id, provider, account_label, status) VALUES ('e1', 'w1', 'imap', 'Inbox', 'connected')", []).unwrap();
+        connection.execute("INSERT INTO emails (id, account_id, subject, sender, recipients, body, received_at) VALUES ('em1', 'e1', 'Hi', 'a@x.com', 'b@x.com', 'body', '2026-08-10T10:00:00Z')", []).unwrap();
+        connection.execute("INSERT INTO chunk_embeddings (chunk_id, model, vector_json) VALUES ('c1', 'nomic-embed-text', '[0.1,0.2]')", []).unwrap();
+        connection.execute("INSERT INTO voice_profiles (id, workspace_id, speaker_label, sample_count) VALUES ('v1', 'w1', 'Alice', 3)", []).unwrap();
+        connection.execute("INSERT INTO speaker_embeddings (profile_id, model, vector_json, sample_count) VALUES ('v1', 'nomic-embed-text', '[0.5]', 3)", []).unwrap();
+        connection.execute("INSERT INTO agents (id, workspace_id, name, prompt, schedule, permission_mode, status) VALUES ('a1', 'w1', 'Bot', 'do it', '0 * * * *', 'full', 'active')", []).unwrap();
+        connection.execute("INSERT INTO agent_runs (id, agent_id, status, retry_count) VALUES ('ar1', 'a1', 'completed', 0)", []).unwrap();
+        connection.execute("INSERT INTO agent_permissions (agent_id, workspace_id, capability, granted) VALUES ('a1', 'w1', 'create_notes', 1)", []).unwrap();
+        connection.execute("INSERT INTO workspace_allowlists (workspace_id, capability) VALUES ('w1', 'read_knowledge')", []).unwrap();
+        connection.execute("INSERT INTO notes (id, workspace_id, title, content) VALUES ('n1', 'w1', 'Note', 'content')", []).unwrap();
+        connection.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider) VALUES ('ce1', 'w1', 'Event', '2026-08-16T09:00:00Z', '2026-08-16T10:00:00Z', 'local')", []).unwrap();
+        connection.execute("INSERT INTO calendar_participants (id, event_id, name, status) VALUES ('cp1', 'ce1', 'Alice', 'accepted')", []).unwrap();
+        connection.execute("INSERT INTO model_routes (workspace_id, capability, provider, model) VALUES ('w1', 'chat', 'openai_compatible', 'qwen')", []).unwrap();
+        connection.execute("INSERT INTO memories (id, workspace_id, content) VALUES ('mem1', 'w1', 'remember this')", []).unwrap();
+        connection.execute("INSERT INTO web_pages (id, workspace_id, url, title) VALUES ('wp1', 'w1', 'https://example.com', 'Example')", []).unwrap();
+        connection.execute("INSERT INTO bot_runs (id, workspace_id, bot_id, status, platform) VALUES ('br1', 'w1', 'bot-1', 'running', 'teams')", []).unwrap();
+        "w1".to_string()
+    }
+
+    #[test]
+    fn workspace_export_roundtrip_preserves_all_domains() {
+        let source = test_connection();
+        let workspace_id = seed_export_workspace(&source);
+        let export = build_workspace_export(&source, &workspace_id).unwrap();
+
+        assert_eq!(export.version, 2);
+        assert_eq!(export.schema_version, 2);
+        assert!(export_hash_valid(&export), "fresh export must hash-verify");
+        assert_eq!(export.row_counts.get("sources"), Some(&2));
+        assert_eq!(export.row_counts.get("source_chunks"), Some(&3));
+        assert_eq!(export.row_counts.get("transcript_segments"), Some(&2));
+        assert_eq!(export.row_counts.get("meeting_summaries"), Some(&1));
+        assert_eq!(export.row_counts.get("meeting_actions"), Some(&1));
+        assert_eq!(export.row_counts.get("calendar_participants"), Some(&1));
+        assert_eq!(export.row_counts.get("notes"), Some(&1));
+        assert_eq!(export.row_counts.get("agent_permissions"), Some(&1));
+
+        // Restore into a fresh database and compare every domain count.
+        let target = test_connection();
+        let restored = apply_workspace_import(&target, &export).unwrap();
+        for (domain, expected) in &export.row_counts {
+            assert_eq!(restored.get(domain), Some(expected), "domain {domain} count mismatch");
+        }
+        // Spot-check row fidelity.
+        let title: String = target.query_row("SELECT title FROM meetings WHERE id = 'm1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(title, "Sync");
+        let lang: String = target.query_row("SELECT language FROM meetings WHERE id = 'm1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(lang, "en");
+        let granted: i64 = target.query_row("SELECT granted FROM agent_permissions WHERE agent_id = 'a1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(granted, 1);
+        let conf: Option<f64> = target.query_row("SELECT confidence FROM transcript_segments WHERE id = 't1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(conf, Some(0.9));
+        // Meeting summary + extracted actions survive the roundtrip.
+        let summary: String = target.query_row("SELECT summary FROM meeting_summaries WHERE meeting_id = 'm1'", [], |r| r.get(0)).unwrap();
+        assert!(summary.contains("Decided to ship"));
+        let action_title: String = target.query_row("SELECT title FROM meeting_actions WHERE id = 'act1'", [], |r| r.get(0)).unwrap();
+        assert_eq!(action_title, "Ship the release");
+    }
+
+    #[test]
+    fn workspace_export_detects_tampering() {
+        let source = test_connection();
+        let workspace_id = seed_export_workspace(&source);
+        let export = build_workspace_export(&source, &workspace_id).unwrap();
+
+        // Tamper with a note's content: hash must no longer verify.
+        let mut tampered = export.clone();
+        tampered.notes[0]["content"] = serde_json::Value::String("MALICIOUS".into());
+        assert!(!export_hash_valid(&tampered), "tampered export must fail hash");
+        assert!(export_hash_valid(&export), "original export still verifies");
+
+        // validate_backup (path-based) must reject the tampered file and accept the clean one.
+        let dir = std::env::temp_dir().join(format!("nao-export-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let clean_path = dir.join("clean.json");
+        let tampered_path = dir.join("tampered.json");
+        std::fs::write(&clean_path, serde_json::to_vec_pretty(&export).unwrap()).unwrap();
+        std::fs::write(&tampered_path, serde_json::to_vec_pretty(&tampered).unwrap()).unwrap();
+        assert!(crate::retention::validate_backup(clean_path.to_str().unwrap()).unwrap());
+        assert!(!crate::retention::validate_backup(tampered_path.to_str().unwrap()).unwrap());
+        // A v1-style file (no hash) still validates as long as fields exist.
+        let legacy = serde_json::json!({ "version": 1, "workspace_id": "w1", "exported_at": "2026-08-14T00:00:00Z", "sources": [] });
+        let legacy_path = dir.join("legacy.json");
+        std::fs::write(&legacy_path, serde_json::to_vec_pretty(&legacy).unwrap()).unwrap();
+        assert!(crate::retention::validate_backup(legacy_path.to_str().unwrap()).unwrap());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_export_empty_hash_is_invalid() {
+        let source = test_connection();
+        let workspace_id = seed_export_workspace(&source);
+        let mut export = build_workspace_export(&source, &workspace_id).unwrap();
+        export.content_hash.clear();
+        assert!(!export_hash_valid(&export));
+    }
+
+    /// #3: the scheduler's auto-record planner finds in-window events that
+    /// match rules, skips already-auto-recorded events, and reports the rule
+    /// action per event.
+    #[test]
+    fn auto_record_planner_windows_rules_and_dedup() {
+        use chrono::Duration;
+        let conn = test_connection();
+        conn.execute("INSERT INTO workspaces (id, name) VALUES ('w1', 'Work')", []).unwrap();
+        let now = Utc::now();
+        let fmt = |d: chrono::DateTime<chrono::Utc>| d.to_rfc3339();
+        // Event starting now → planned.
+        conn.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider) VALUES ('e-now', 'w1', 'Daily Standup', ?1, ?2, 'local')", params![fmt(now), fmt(now + Duration::minutes(30))]).unwrap();
+        // Event starting in 3 hours → outside the 2-min window, not planned.
+        conn.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider) VALUES ('e-later', 'w1', 'Daily Standup', ?1, ?2, 'local')", params![fmt(now + Duration::hours(3)), fmt(now + Duration::hours(4))]).unwrap();
+        // Event already auto-recorded → skipped even though in-window.
+        conn.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider, recording_auto_started) VALUES ('e-done', 'w1', 'Daily Standup', ?1, ?2, 'local', ?3)", params![fmt(now + Duration::seconds(30)), fmt(now + Duration::minutes(30)), fmt(now)]).unwrap();
+        // An event with no matching rule falls back to the global mode.
+        conn.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider) VALUES ('e-plain', 'w1', 'Unrelated Chat', ?1, ?2, 'local')", params![fmt(now + Duration::seconds(10)), fmt(now + Duration::minutes(20))]).unwrap();
+
+        // Rule: calendar titles containing "standup" → automatic (priority 1);
+        // global default = confirm.
+        crate::calendar_complete::set_recording_rule(&conn, "w1", "calendar", "standup", "automatic", 1).unwrap();
+        conn.execute("INSERT INTO app_settings (key, value) VALUES ('recordingMode', 'confirm')", []).unwrap();
+
+        let plans = plan_auto_recordings(&conn).unwrap();
+        let by_event: std::collections::HashMap<&str, &AutoRecordPlan> = plans.iter().map(|p| (p.event_id.as_str(), p)).collect();
+        assert_eq!(by_event.len(), 2, "only e-now and e-plain should be planned: {plans:?}");
+        assert_eq!(by_event["e-now"].action, "automatic");
+        assert_eq!(by_event["e-now"].ends_at.as_deref(), Some(fmt(now + Duration::minutes(30)).as_str()));
+        assert_eq!(by_event["e-plain"].action, "confirm");
+        assert!(!by_event.contains_key("e-later"), "outside window");
+        assert!(!by_event.contains_key("e-done"), "already auto-recorded");
+    }
+
+    /// #Knowledge-tab fix: user queries containing FTS5 syntax characters
+    /// (commas, quotes, parens) must match literally instead of raising
+    /// `fts5: syntax error near ","`.
+    #[test]
+    fn fts5_match_terms_never_raises_syntax_errors() {
+        let conn = test_connection();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS fts_probe USING fts5(content);
+             INSERT INTO fts_probe (content) VALUES ('hello, world notes are here');
+             INSERT INTO fts_probe (content) VALUES ('unrelated item');",
+        ).unwrap();
+
+        let count_for = |q: &str| -> i64 {
+            let expr = fts5_match_terms(q);
+            conn.query_row(
+                "SELECT COUNT(*) FROM fts_probe WHERE fts_probe MATCH ?1",
+                params![expr], |r| r.get(0),
+            ).unwrap()
+        };
+        // The reported bug: a comma in the query.
+        assert_eq!(count_for("hello, world"), 1, "comma query must match literally");
+        // Quotes, parens, and apostrophes are literal too (bound params keep
+        // the SQL string safe).
+        assert_eq!(count_for("say \"hi\" (now)"), 0, "no such row -> no syntax error, 0 hits");
+        assert_eq!(count_for("hello notes"), 1, "plain multi-term OR still works");
+        assert_eq!(count_for("user's data"), 0, "apostrophe is safe via bound param");
+        assert_eq!(fts5_match_terms("   "), "", "whitespace-only -> empty expression");
+    }
+
+    /// Gmail/Outlook accounts get provider-default IMAP hosts automatically
+    /// (fixes "Set Gmail IMAP host to imap.gmail.com" when the field was left
+    /// empty at connect time).
+    #[test]
+    fn imap_host_defaults_for_managed_providers() {
+        assert_eq!(default_imap_host("gmail"), Some("imap.gmail.com"));
+        assert_eq!(default_imap_host("outlook"), Some("outlook.office365.com"));
+        assert_eq!(default_imap_host("imap"), None, "custom providers must supply a host");
+    }
+
+    /// Hosts are inferred from the account address domain, not just the
+    /// provider dropdown (e.g. a Yahoo address under the generic "imap"
+    /// provider still gets imap.mail.yahoo.com).
+    #[test]
+    fn hosts_are_mapped_from_account_address() {
+        assert_eq!(hosts_for_address("me@gmail.com"), (Some("imap.gmail.com"), Some("smtp.gmail.com")));
+        assert_eq!(hosts_for_address("me@hotmail.com"), (Some("outlook.office365.com"), Some("smtp-mail.outlook.com")));
+        assert_eq!(hosts_for_address("Me@Outlook.COM"), (Some("outlook.office365.com"), Some("smtp-mail.outlook.com")), "case-insensitive");
+        assert_eq!(hosts_for_address("me@yahoo.com"), (Some("imap.mail.yahoo.com"), Some("smtp.mail.yahoo.com")));
+        assert_eq!(hosts_for_address("me@icloud.com"), (Some("imap.mail.me.com"), Some("smtp.mail.me.com")));
+        assert_eq!(hosts_for_address("me@aol.com"), (Some("imap.aol.com"), Some("smtp.aol.com")));
+        assert_eq!(hosts_for_address("me@zoho.com"), (Some("imap.zoho.com"), Some("smtp.zoho.com")));
+        assert_eq!(hosts_for_address("me@mycompany.com"), (None, None), "unknown domains need manual hosts");
+        assert_eq!(hosts_for_address("no-at-sign"), (None, None));
+    }
+
+    #[test]
+    fn percent_decode_decodes_query_values() {
+        assert_eq!(percent_decode("API%20Teams%20Upload"), "API Teams Upload");
+        assert_eq!(percent_decode("meet-1"), "meet-1");
+        assert_eq!(percent_decode("a%2Fb"), "a/b");
+        assert_eq!(percent_decode("100%25"), "100%");
+        assert_eq!(percent_decode("bad%zz"), "bad%zz"); // invalid escapes stay literal
+        assert_eq!(percent_decode(""), "");
+    }
+
+    #[test]
+    fn ollama_base_url_strips_api_suffix() {
+        // NEURAL_OLLAMA_URL commonly points at /api/generate.
+        std::env::set_var("NEURAL_OLLAMA_URL", "http://127.0.0.1:11434/api/generate");
+        assert_eq!(ollama_base_url(), "http://127.0.0.1:11434");
+        std::env::set_var("NEURAL_OLLAMA_URL", "http://localhost:11434/api/");
+        assert_eq!(ollama_base_url(), "http://localhost:11434");
+        // A bare root URL passes through untouched.
+        std::env::set_var("NEURAL_OLLAMA_URL", "http://192.168.1.10:11434");
+        assert_eq!(ollama_base_url(), "http://192.168.1.10:11434");
+        std::env::remove_var("NEURAL_OLLAMA_URL");
+        assert_eq!(ollama_base_url(), "http://127.0.0.1:11434");
     }
 
     #[test]
@@ -4327,4 +6144,99 @@ mod tests {
         let schedule = Schedule::from_str("0 * * * * *").expect("valid cron expression");
         assert!(schedule.upcoming(Utc).next().is_some());
     }
+
+    #[test]
+    fn capture_child_is_terminated_on_cleanup() {
+        let child = if cfg!(target_os = "windows") {
+            Command::new("cmd").args(["/C", "ping", "127.0.0.1", "-n", "30"]).spawn().unwrap()
+        } else {
+            Command::new("sleep").arg("30").spawn().unwrap()
+        };
+        assert!(terminate_capture_child(child).is_ok());
+    }
+
+    /// Regression: `create_note` previously passed 4 params to a 5-slot
+    /// INSERT (the `now` timestamp was missing), so the Notes view could never
+    /// save a note. The shared helper must succeed against the real schema.
+    #[test]
+    fn create_note_insert_matches_schema() {
+        let connection = test_connection();
+        // `open_database` seeds the default workspaces; unit tests must too
+        // (notes.workspace_id has an FK to workspaces.id).
+        connection.execute(
+            "INSERT OR IGNORE INTO workspaces (id, name, source_count) VALUES (?1, ?2, ?3)",
+            params!["personal", "Personal", 0],
+        ).unwrap();
+        let now = crate::Utc::now().to_rfc3339();
+        insert_note(&connection, "note-1", "personal", "Title", "Body", &now).expect("note insert should succeed");
+        let count: i64 = connection.query_row("SELECT COUNT(*) FROM notes WHERE id = 'note-1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(count, 1, "note row must exist");
+        let search_count: i64 = connection.query_row("SELECT COUNT(*) FROM note_search WHERE note_id = 'note-1'", [], |row| row.get(0)).unwrap();
+        assert_eq!(search_count, 1, "note_search FTS row must exist");
+        // The same schema must also accept an update path used by update_note
+        connection.execute("UPDATE notes SET title = ?1, content = ?2, updated_at = ?3 WHERE id = ?4", params!["T2", "C2", now, "note-1"]).unwrap();
+        connection.execute("UPDATE note_search SET title = ?1, content = ?2 WHERE note_id = ?3", params!["T2", "C2", "note-1"]).unwrap();
+    }
+
 }
+
+#[cfg(test)]
+mod voice_silence_tests {
+    use super::analyze_wav_silence;
+
+    /// Build a 16-bit PCM mono WAVE file in memory (16 kHz).
+    fn synth_wav(seconds: f32, amplitude: f32, sample_rate: u32) -> Vec<u8> {
+        let channels: u16 = 1;
+        let bits: u16 = 16;
+        let frame_count = (seconds * sample_rate as f32) as usize;
+        let data_len = frame_count * (bits as usize / 8) * channels as usize;
+        let mut bytes = Vec::with_capacity(44 + data_len);
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVE");
+        bytes.extend_from_slice(b"fmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes()); // PCM
+        bytes.extend_from_slice(&channels.to_le_bytes());
+        bytes.extend_from_slice(&sample_rate.to_le_bytes());
+        bytes.extend_from_slice(&(sample_rate * channels as u32 * (bits as u32 / 8)).to_le_bytes());
+        bytes.extend_from_slice(&(channels * (bits / 8)).to_le_bytes());
+        bytes.extend_from_slice(&bits.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        for i in 0..frame_count {
+            let sample = ((i as f32 / sample_rate as f32 * 220.0 * std::f32::consts::TAU).sin() * amplitude * 32767.0) as i16;
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn silence_detection_quiet_clip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("nao-silence-quiet.wav");
+        std::fs::write(&path, synth_wav(2.0, 0.001, 16000)).unwrap();
+        let (rms, has_speech, duration) = analyze_wav_silence(&path, 1.2).expect("decodes");
+        assert!(rms < 0.01, "quiet clip rms {rms} should be near zero");
+        assert!(!has_speech);
+        assert!((duration - 2.0).abs() < 0.01);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn silence_detection_loud_clip() {
+        let dir = std::env::temp_dir();
+        let path = dir.join("nao-silence-loud.wav");
+        std::fs::write(&path, synth_wav(2.0, 0.25, 16000)).unwrap();
+        let (rms, has_speech, _) = analyze_wav_silence(&path, 1.2).expect("decodes");
+        assert!(rms > 0.1, "loud clip rms {rms} should be well above threshold");
+        assert!(has_speech);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn silence_detection_missing_file() {
+        assert!(analyze_wav_silence(&std::path::PathBuf::from("/nonexistent/x.wav"), 1.2).is_none());
+    }
+}
+

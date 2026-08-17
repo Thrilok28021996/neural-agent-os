@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type SourceDeletionPreview = { source_id: string; source_title: string; source_kind: string; chunks: number; embeddings: number; total_size_estimate: number }
 export type MeetingDeletionPreview = { meeting_id: string; meeting_title: string; transcript_segments: number; actions: number; summary_exists: boolean; recording_path?: string; recording_size: number }

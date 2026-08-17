@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type CloudTranscriptionResult = {
   job_id: string
@@ -9,6 +9,6 @@ export type CloudTranscriptionResult = {
   segments: number
 }
 
-export function cloudTranscribe(meetingId: string, recordingPath: string, provider: string, model: string) {
-  return invoke<CloudTranscriptionResult>('cloud_transcribe', { meetingId, recordingPath, provider, model })
+export function cloudTranscribe(meetingId: string, recordingPath: string, provider: string, model: string, language?: string) {
+  return invoke<CloudTranscriptionResult>('cloud_transcribe', { meetingId, recordingPath, provider, model, language })
 }

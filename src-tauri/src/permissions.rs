@@ -24,6 +24,7 @@ const CAPABILITIES: &[&str] = &[
     "create_reminders",
     "modify_tasks",
     "schedule_events",
+    "delete_data",
     "draft_email",
     "send_email",
     "modify_files",
@@ -37,6 +38,7 @@ pub fn check_permission(
     workspace_id: &str,
     capability: &str,
 ) -> PermissionCheck {
+    log::debug!("permissions::check_permission: enter");
     // Default: all external agents are read-only unless explicitly granted
     let default_allowed = is_read_capability(capability);
 
@@ -111,6 +113,7 @@ pub fn grant_permission(
     workspace_id: &str,
     capability: &str,
 ) -> Result<(), String> {
+    log::info!("permissions::grant_permission: enter");
     if !CAPABILITIES.contains(&capability) {
         return Err(format!("Unknown capability: {capability}"));
     }
@@ -133,6 +136,7 @@ pub fn revoke_permission(
     workspace_id: &str,
     capability: &str,
 ) -> Result<(), String> {
+    log::info!("permissions::revoke_permission: enter");
     connection
         .execute(
             "UPDATE agent_permissions SET granted = 0
@@ -149,6 +153,7 @@ pub fn list_agent_permissions(
     agent_id: &str,
     workspace_id: &str,
 ) -> Result<Vec<AgentPermission>, String> {
+    log::debug!("permissions::list_agent_permissions: enter");
     let mut stmt = connection
         .prepare(
             "SELECT agent_id, capability, granted, workspace_id
@@ -192,6 +197,7 @@ pub fn check_all_permissions(
     agent_id: &str,
     workspace_id: &str,
 ) -> Result<Vec<PermissionCheck>, String> {
+    log::debug!("permissions::check_all_permissions: enter");
     CAPABILITIES
         .iter()
         .map(|cap| Ok(check_permission(connection, agent_id, workspace_id, cap)))
@@ -205,6 +211,7 @@ pub fn validate_action(
     workspace_id: &str,
     capability: &str,
 ) -> Result<(), String> {
+    log::debug!("permissions::validate_action: enter");
     let check = check_permission(connection, agent_id, workspace_id, capability);
     if !check.allowed {
         return Err(format!(
@@ -225,13 +232,14 @@ pub fn authorize_action(
     description: &str,
     payload: &serde_json::Value,
 ) -> Result<Option<super::approvals::ApprovalRequest>, String> {
+    log::info!("permissions::authorize_action: enter");
     // Step 1: Check permission (validate_action centralizes the denial path)
     validate_action(connection, agent_id, workspace_id, capability)?;
 
     // Step 2: Check if this capability requires approval
     let requires_approval = matches!(
         capability,
-        "send_email" | "modify_calendar" | "delete_data" | "execute_commands" | "modify_files" | "draft_email"
+        "send_email" | "schedule_events" | "delete_data" | "execute_commands" | "modify_files" | "draft_email"
     );
 
     if !requires_approval {
@@ -257,6 +265,7 @@ pub fn set_workspace_allowlist(
     workspace_id: &str,
     allowed_capabilities: &[String],
 ) -> Result<(), String> {
+    log::info!("permissions::set_workspace_allowlist: enter");
     // Clear existing allowlist
     connection
         .execute(
@@ -283,6 +292,7 @@ pub fn get_workspace_allowlist(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<String>, String> {
+    log::debug!("permissions::get_workspace_allowlist: enter");
     let mut stmt = connection
         .prepare(
             "SELECT capability FROM workspace_allowlists WHERE workspace_id = ?1",
@@ -364,7 +374,7 @@ mod tests {
     fn list_agent_permissions_includes_defaults() {
         let conn = setup();
         let perms = list_agent_permissions(&conn, "agent-1", "w1").unwrap();
-        assert_eq!(perms.len(), 10);
+        assert_eq!(perms.len(), 11);
         assert!(perms.iter().any(|p| p.capability == "read_knowledge" && p.granted));
         assert!(perms.iter().any(|p| p.capability == "send_email" && !p.granted));
     }
@@ -425,6 +435,6 @@ mod tests {
         // Empty allowlist means unrestricted (default set of capabilities).
         set_workspace_allowlist(&conn, "w1", &[]).unwrap();
         let all = get_workspace_allowlist(&conn, "w1").unwrap();
-        assert_eq!(all.len(), 10);
+        assert_eq!(all.len(), 11);
     }
 }

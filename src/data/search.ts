@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type IndexResult = { sources_indexed: number; chunks_indexed: number }
 

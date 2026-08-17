@@ -48,7 +48,7 @@ describe('AC1: Install without account', () => {
   it('local settings load without any user identity', async () => {
     const { loadSettings } = await import('../../src/data/settings')
     const settings = loadSettings()
-    expect(settings.dataDirectory).toBe('Choose a local folder') // default, no account needed
+    expect(settings.dataDirectory).toBe('~/Neural Agent OS') // unified data root // default, no account needed
     expect(settings.recordingMode).toBe('confirm')
     expect(settings.allowCloudAudio).toBe(false)
   })
@@ -245,7 +245,7 @@ describe('AC12-15: Summaries, actions, tasks, reminders', () => {
     vi.mocked(invoke).mockResolvedValue({ meeting_id: 'm-1', model: 'qwen3:14b', summary: '...', actions: [] })
     const { summarizeMeeting } = await import('../../src/data/summaries')
     await summarizeMeeting('m-1')
-    expect(invoke).toHaveBeenCalledWith('summarize_meeting', { meetingId: 'm-1', model: 'qwen3:14b' })
+    expect(invoke).toHaveBeenCalledWith('summarize_meeting', { meetingId: 'm-1', model: 'qwen/qwen3.5-9b' })
   })
 
   it('extracts actions and promotes them to tasks', async () => {

@@ -25,6 +25,7 @@ pub fn add_monitored_folder(
     workspace_id: &str,
     path: &str,
 ) -> Result<MonitoredFolder, String> {
+    log::info!("monitoring::add_monitored_folder: enter");
     let canonical = std::path::PathBuf::from(path);
     if !canonical.is_dir() {
         return Err(format!("Folder does not exist: {path}"));
@@ -54,6 +55,7 @@ pub fn list_monitored_folders(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<MonitoredFolder>, String> {
+    log::debug!("monitoring::list_monitored_folders: enter");
     let mut statement = connection
         .prepare(
             "SELECT id, workspace_id, path, enabled, last_checked_at,
@@ -85,6 +87,7 @@ pub fn toggle_monitored_folder(
     folder_id: &str,
     enabled: bool,
 ) -> Result<(), String> {
+    log::info!("monitoring::toggle_monitored_folder: enter");
     connection
         .execute(
             "UPDATE monitored_folders SET enabled = ?1 WHERE id = ?2",
@@ -99,6 +102,7 @@ pub fn remove_monitored_folder(
     connection: &Connection,
     folder_id: &str,
 ) -> Result<(), String> {
+    log::info!("monitoring::remove_monitored_folder: enter");
     connection
         .execute(
             "DELETE FROM monitored_folders WHERE id = ?1",
@@ -114,6 +118,7 @@ pub fn check_monitored_folders(
     app: &tauri::AppHandle,
     connection: &Connection,
 ) -> Result<Vec<MonitorResult>, String> {
+    log::debug!("monitoring::check_monitored_folders: enter");
     let mut statement = connection
         .prepare(
             "SELECT id, workspace_id, path FROM monitored_folders WHERE enabled = 1",

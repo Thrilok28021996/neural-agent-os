@@ -18,8 +18,9 @@ pub struct ProviderHealth {
 pub fn health_check(
     provider: &str,
     capability: &str,
-    model: &str,
+    _model: &str,
 ) -> (bool, Option<u64>, Option<String>) {
+    log::info!("health::health_check: enter");
     let start = Instant::now();
 
     match provider {
@@ -85,6 +86,7 @@ pub fn refresh_provider_health(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<ProviderHealth>, String> {
+    log::info!("health::refresh_provider_health: enter");
     let mut stmt = connection.prepare(
         "SELECT provider, capability, model FROM model_routes WHERE workspace_id = ?1
          UNION SELECT provider, capability, model FROM provider_fallback WHERE workspace_id = ?1"
@@ -147,6 +149,7 @@ pub fn get_provider_health(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<ProviderHealth>, String> {
+    log::debug!("health::get_provider_health: enter");
     let mut stmt = connection.prepare(
         "SELECT h.provider, h.capability, COALESCE(r.model, f.model, 'unknown'),
                 h.healthy, h.checked_at, h.response_time_ms, h.error_message, h.consecutive_failures

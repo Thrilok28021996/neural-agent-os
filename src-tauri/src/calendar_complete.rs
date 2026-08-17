@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection};
-use chrono::{Utc, Datelike, Timelike, Duration, NaiveDateTime, Months};
+use chrono::{Utc, Duration, NaiveDateTime, Months};
 use serde::Serialize;
 
 #[derive(Serialize, Clone)]
@@ -27,6 +27,7 @@ pub fn expand_recurring_event(
     from_date: &str,
     to_date: &str,
 ) -> Result<Vec<ExpandedEvent>, String> {
+    log::info!("calendar_complete::expand_recurring_event: enter");
     let (title, starts_at, ends_at, meeting_url, recurrence): (
         String, String, String, Option<String>, Option<String>,
     ) = connection.query_row(
@@ -165,6 +166,7 @@ fn parse_rfc3339(s: &str) -> Result<chrono::DateTime<Utc>, String> {
 
 /// Common timezone information
 pub fn common_timezones() -> Vec<TimeZoneInfo> {
+    log::info!("calendar_complete::common_timezones: enter");
     vec![
         TimeZoneInfo { iana_name: "America/New_York".into(), utc_offset_hours: -5.0, display_name: "Eastern (UTC-5)".into() },
         TimeZoneInfo { iana_name: "America/Chicago".into(), utc_offset_hours: -6.0, display_name: "Central (UTC-6)".into() },
@@ -184,6 +186,7 @@ pub fn convert_timezone(
     from_offset_hours: f64,
     to_offset_hours: f64,
 ) -> Result<String, String> {
+    log::info!("calendar_complete::convert_timezone: enter");
     let dt = parse_rfc3339(dt_str)?;
     let adjusted = dt + Duration::seconds(((to_offset_hours - from_offset_hours) * 3600.0) as i64);
     Ok(adjusted.to_rfc3339())
@@ -208,6 +211,7 @@ pub fn evaluate_recording_rules(
     meeting_url: Option<&str>,
     participants: &[String],
 ) -> Result<String, String> {
+    log::info!("calendar_complete::evaluate_recording_rules: enter");
     let mut stmt = connection.prepare(
         "SELECT rule_type, pattern, action, priority FROM recording_rules
          WHERE workspace_id = ?1 AND enabled = 1
@@ -249,6 +253,7 @@ pub fn set_recording_rule(
     action: &str,
     priority: i32,
 ) -> Result<(), String> {
+    log::info!("calendar_complete::set_recording_rule: enter");
     let id = format!("rule-{}", uuid::Uuid::new_v4());
     connection.execute(
         "INSERT INTO recording_rules (id, workspace_id, rule_type, pattern, action, priority, enabled)
@@ -260,10 +265,20 @@ pub fn set_recording_rule(
 }
 
 /// List all enabled recording rules for a workspace, ordered by priority.
+/// Delete a recording rule.
+pub fn delete_recording_rule(connection: &Connection, rule_id: &str) -> Result<(), String> {
+    let changed = connection.execute("DELETE FROM recording_rules WHERE id = ?1", params![rule_id])
+        .map_err(|e| e.to_string())?;
+    if changed == 0 { return Err(format!("Recording rule not found: {rule_id}")); }
+    log::info!("calendar_complete::delete_recording_rule: removed {rule_id}");
+    Ok(())
+}
+
 pub fn list_recording_rules(
     connection: &Connection,
     workspace_id: &str,
 ) -> Result<Vec<RecordingRule>, String> {
+    log::debug!("calendar_complete::list_recording_rules: enter");
     let mut stmt = connection.prepare(
         "SELECT id, workspace_id, rule_type, pattern, action, priority
          FROM recording_rules
@@ -375,6 +390,18 @@ mod tests {
         let rules = list_recording_rules(&conn, "w1").unwrap();
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0].rule_type, "calendar");
+    }
+
+    #[test]
+    fn recording_rule_can_be_deleted() {
+        let conn = setup();
+        set_recording_rule(&conn, "w1", "calendar", "standup", "automatic", 1).unwrap();
+        let rules = list_recording_rules(&conn, "w1").unwrap();
+        assert_eq!(rules.len(), 1);
+        delete_recording_rule(&conn, &rules[0].id).unwrap();
+        assert!(list_recording_rules(&conn, "w1").unwrap().is_empty());
+        // Deleting a missing rule is a clean error, not a panic.
+        assert!(delete_recording_rule(&conn, "rule-nope").is_err());
     }
 
     #[test]

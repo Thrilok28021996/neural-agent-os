@@ -1,5 +1,5 @@
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 
 #[derive(Serialize, Clone)]
@@ -15,6 +15,17 @@ pub struct DiarizationResult {
     pub segments: Vec<DiarizedSegment>,
     pub speaker_count: usize,
     pub embedding_model: String,
+    /// Which backend produced this result: "audio" or "text-embedding".
+    pub backend: String,
+}
+
+/// One speaker window produced by the audio-based diarizer CLI.
+/// Contract: `diarize --json <audio>` prints `{"segments":[{start,end,speaker}]}`.
+#[derive(serde::Deserialize)]
+pub struct AudioSpeakerWindow {
+    pub start: f64,
+    pub end: f64,
+    pub speaker: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -28,23 +39,18 @@ pub struct DiarizedSegment {
     pub matched_profile_id: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct OllamaEmbedResponse {
-    embedding: Vec<f32>,
-}
-
 /// Extract speaker embeddings for a voice profile from transcript samples.
-/// Uses Ollama embeddings to create a vector representation of how a speaker talks.
+/// Uses the workspace's embedding route (LM Studio by default).mbeddings to create a vector representation of how a speaker talks.
 pub fn build_speaker_embedding(
     connection: &Connection,
     profile_id: &str,
     model: &str,
 ) -> Result<SpeakerEmbedding, String> {
-    let (speaker_label, sample_count): (String, i64) = connection
+    let (speaker_label, sample_count, workspace_id): (String, i64, String) = connection
         .query_row(
-            "SELECT speaker_label, sample_count FROM voice_profiles WHERE id = ?1",
+            "SELECT speaker_label, sample_count, workspace_id FROM voice_profiles WHERE id = ?1",
             params![profile_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .map_err(|e| e.to_string())?;
 
@@ -73,18 +79,8 @@ pub fn build_speaker_embedding(
     }
 
     let combined = samples.join(" ");
-    let endpoint = std::env::var("NEURAL_OLLAMA_EMBEDDINGS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/embeddings".into());
-
-    let response = reqwest::blocking::Client::new()
-        .post(&endpoint)
-        .json(&serde_json::json!({ "model": model, "prompt": combined }))
-        .send()
-        .map_err(|e| format!("Ollama embeddings unavailable: {e}"))?
-        .error_for_status()
-        .map_err(|e| e.to_string())?
-        .json::<OllamaEmbedResponse>()
-        .map_err(|e| e.to_string())?;
+    let provider = crate::chat::routed_provider(connection, &workspace_id, "embeddings");
+    let embedding = crate::embed_text(&provider, model, &combined)?;
 
     // Store the embedding
     connection
@@ -99,7 +95,7 @@ pub fn build_speaker_embedding(
             params![
                 profile_id,
                 model,
-                serde_json::to_string(&response.embedding).map_err(|e| e.to_string())?,
+                serde_json::to_string(&embedding).map_err(|e| e.to_string())?,
                 sample_count,
             ],
         )
@@ -108,7 +104,7 @@ pub fn build_speaker_embedding(
     Ok(SpeakerEmbedding {
         profile_id: profile_id.to_string(),
         speaker_label,
-        embedding: response.embedding,
+        embedding,
         sample_count,
     })
 }
@@ -214,11 +210,11 @@ pub fn diarize_transcript(
             segments: Vec::new(),
             speaker_count: 0,
             embedding_model: embedding_model.to_string(),
+            backend: "text-embedding".to_string(),
         });
     }
 
-    let endpoint = std::env::var("NEURAL_OLLAMA_EMBEDDINGS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/embeddings".into());
+    let embed_provider = crate::chat::routed_provider(connection, workspace_id, "embeddings");
 
     // Simple speaker turn detection with embedding matching
     let mut diarized = Vec::new();
@@ -230,17 +226,8 @@ pub fn diarize_transcript(
         let mut confidence = 0.0f32;
         let mut matched_id = None;
 
-        // Get embedding for this segment
-        let seg_embedding = reqwest::blocking::Client::new()
-            .post(&endpoint)
-            .json(&serde_json::json!({
-                "model": embedding_model,
-                "prompt": text,
-            }))
-            .send()
-            .ok()
-            .and_then(|r| r.json::<OllamaEmbedResponse>().ok())
-            .map(|r| r.embedding);
+        // Get embedding for this segment (provider-aware: LM Studio or Ollama)
+        let seg_embedding = crate::embed_text(&embed_provider, embedding_model, text).ok();
 
         if let Some(ref embed) = seg_embedding {
             // Match against known profiles
@@ -277,7 +264,7 @@ pub fn diarize_transcript(
         // Update the segment in database
         connection
             .execute(
-                "UPDATE transcript_segments SET speaker = ?1, confidence = ?2 WHERE id = ?3",
+                "UPDATE transcript_segments SET speaker = ?1, speaker_confidence = ?2 WHERE id = ?3",
                 params![speaker_label, confidence, seg_id],
             )
             .map_err(|e| e.to_string())?;
@@ -300,6 +287,7 @@ pub fn diarize_transcript(
         segments: merged,
         speaker_count: speaker_set.len(),
         embedding_model: embedding_model.to_string(),
+        backend: "text-embedding".to_string(),
     })
 }
 
@@ -347,24 +335,108 @@ fn merge_adjacent_speakers(
 }
 
 /// Get embedding for a single text segment
+#[allow(dead_code)] // tested public API (embedding unit tests)
 pub fn get_segment_embedding(
     text: &str,
     model: &str,
 ) -> Result<Vec<f32>, String> {
-    let endpoint = std::env::var("NEURAL_OLLAMA_EMBEDDINGS_URL")
-        .unwrap_or_else(|_| "http://127.0.0.1:11434/api/embeddings".into());
+    // Default provider is LM Studio / local OpenAI-compatible runtime.
+    crate::embed_text("openai_compatible", model, text)
+}
 
-    let response = reqwest::blocking::Client::new()
-        .post(&endpoint)
-        .json(&serde_json::json!({ "model": model, "prompt": text }))
-        .send()
-        .map_err(|e| format!("Ollama embeddings unavailable: {e}"))?
-        .error_for_status()
+
+/// Fraction of the transcript segment's duration overlapped by the speaker
+/// window, used both for choosing the best window and as the assignment
+/// confidence.
+fn overlap_fraction(seg_start: f64, seg_end: f64, win_start: f64, win_end: f64) -> f64 {
+    let overlap = seg_end.min(win_end) - seg_start.max(win_start);
+    if overlap <= 0.0 {
+        return 0.0;
+    }
+    (overlap / (seg_end - seg_start).max(0.001)).clamp(0.0, 1.0)
+}
+
+/// Run the optional audio-based diarizer (`scripts/diarize.py`, resolved via
+/// `NEURAL_DIARIZE_BIN` or PATH) over the recording and assign speaker labels
+/// to transcript segments by time overlap.
+///
+/// Returns:
+/// - `Ok(Some(n))` — audio diarization ran and assigned `n` segments;
+/// - `Ok(None)`   — the diarizer is not installed (caller falls back to the
+///   text-embedding matcher);
+/// - `Err(msg)`   — the diarizer is installed but failed to run/parse.
+pub fn diarize_audio(
+    connection: &Connection,
+    meeting_id: &str,
+    _workspace_id: &str,
+    recording_path: &str,
+) -> Result<Option<usize>, String> {
+    let diarize = match crate::resolve_binary("diarize", "NEURAL_DIARIZE_BIN") {
+        Ok(bin) => bin,
+        Err(_) => {
+            log::debug!("diarization: audio diarizer not installed; text fallback will be used");
+            return Ok(None);
+        }
+    };
+    log::info!("diarization: running audio diarizer {diarize} on {recording_path}");
+    let output = std::process::Command::new(&diarize)
+        .arg("--json")
+        .arg(recording_path)
+        .output()
+        .map_err(|e| format!("Failed to launch diarizer ({diarize}): {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "Diarizer exited with {:?}: {}",
+            output.status.code(),
+            stderr.trim()
+        ));
+    }
+    #[derive(serde::Deserialize)]
+    struct DiarizerOutput {
+        segments: Vec<AudioSpeakerWindow>,
+    }
+    let parsed: DiarizerOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|e| format!("Diarizer JSON parse failed: {e}"))?;
+    let windows = parsed.segments;
+    if windows.is_empty() {
+        log::warn!("diarization: diarizer produced no speaker windows for {recording_path}");
+        return Ok(Some(0));
+    }
+
+    let mut stmt = connection
+        .prepare(
+            "SELECT id, start_seconds, end_seconds FROM transcript_segments WHERE meeting_id = ?1 ORDER BY start_seconds",
+        )
+        .map_err(|e| e.to_string())?;
+    let segments: Vec<(String, f64, f64)> = stmt
+        .query_map(params![meeting_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
         .map_err(|e| e.to_string())?
-        .json::<OllamaEmbedResponse>()
+        .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
 
-    Ok(response.embedding)
+    let mut assigned = 0usize;
+    for (segment_id, seg_start, seg_end) in &segments {
+        let mut best: Option<(f64, &AudioSpeakerWindow)> = None;
+        for window in &windows {
+            let fraction = overlap_fraction(*seg_start, *seg_end, window.start, window.end);
+            if fraction > 0.0 && best.map_or(true, |(best_fraction, _)| fraction > best_fraction) {
+                best = Some((fraction, window));
+            }
+        }
+        if let Some((fraction, window)) = best {
+            let confidence = fraction as f32;
+            connection
+                .execute(
+                    "UPDATE transcript_segments SET speaker = ?1, speaker_confidence = ?2 WHERE id = ?3",
+                    params![window.speaker, confidence, segment_id],
+                )
+                .map_err(|e| e.to_string())?;
+            assigned += 1;
+        }
+    }
+    log::info!("diarization: audio backend assigned {assigned}/{} segments for meeting {meeting_id}", segments.len());
+    Ok(Some(assigned))
 }
 
 #[cfg(test)]
@@ -417,4 +489,75 @@ mod tests {
     fn merge_handles_empty_input() {
         assert!(merge_adjacent_speakers(vec![]).is_empty());
     }
+
+    #[test]
+    fn overlap_fraction_handles_partial_full_and_none() {
+        assert_eq!(overlap_fraction(0.0, 10.0, 2.0, 8.0), 0.6);
+        assert_eq!(overlap_fraction(0.0, 10.0, 0.0, 10.0), 1.0);
+        assert_eq!(overlap_fraction(0.0, 10.0, 20.0, 30.0), 0.0);
+        assert_eq!(overlap_fraction(5.0, 5.0, 0.0, 10.0), 0.0); // zero-length segment
+    }
+
+    #[test]
+    fn diarize_audio_maps_windows_to_segments() {
+        let _env_guard = crate::tests::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Fake diarizer binary: emits two speaker windows as JSON.
+        let dir = std::env::temp_dir().join(format!("nao-diarize-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("fake_diarize.sh");
+        std::fs::write(&script, "#!/bin/sh\ncat <<'EOF'\n{\"segments\":[{\"start\":0.0,\"end\":4.0,\"speaker\":\"SPEAKER_00\"},{\"start\":4.0,\"end\":10.0,\"speaker\":\"SPEAKER_01\"}]}\nEOF\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let conn = crate::tests::test_connection();
+        conn.execute(
+            "INSERT INTO workspaces (id, name) VALUES ('personal', 'Personal')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meetings (id, workspace_id, title, status) VALUES ('m1', 'personal', 'T', 'transcribed')",
+            [],
+        )
+        .unwrap();
+        for (id, start, end) in [("s1", 0.0, 3.0), ("s2", 5.0, 9.0), ("s3", 12.0, 15.0)] {
+            conn.execute(
+                "INSERT INTO transcript_segments (id, meeting_id, start_seconds, end_seconds, text) VALUES (?1, 'm1', ?2, ?3, 'x')",
+                params![id, start, end],
+            )
+            .unwrap();
+        }
+
+        std::env::set_var("NEURAL_DIARIZE_BIN", script.to_string_lossy().into_owned());
+        let result = diarize_audio(&conn, "m1", "personal", "/tmp/recording.wav");
+        std::env::remove_var("NEURAL_DIARIZE_BIN");
+        // Once unset the backend is "not installed" again -> Ok(None).
+        let missing = diarize_audio(&conn, "m1", "personal", "/tmp/recording.wav");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(missing, Ok(None)), "missing diarizer -> Ok(None), got {missing:?}");
+
+        let assigned = result.expect("audio diarization ran").expect("Some(assigned)");
+        assert_eq!(assigned, 2);
+        let (s1_speaker, s1_conf): (String, f32) = conn
+            .query_row("SELECT speaker, speaker_confidence FROM transcript_segments WHERE id = 's1'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(s1_speaker, "SPEAKER_00");
+        assert!((s1_conf - 1.0).abs() < 1e-4, "full overlap -> confidence 1.0, got {s1_conf}");
+        let (s2_speaker, s2_conf): (String, f32) = conn
+            .query_row("SELECT speaker, speaker_confidence FROM transcript_segments WHERE id = 's2'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(s2_speaker, "SPEAKER_01");
+        // 5.0-9.0 overlaps window 4.0-10.0 fully -> confidence 1.0
+        assert!((s2_conf - 1.0).abs() < 1e-4, "got {s2_conf}");
+        // s3 overlaps nothing -> untouched
+        let (s3_speaker, s3_conf): (Option<String>, Option<f32>) = conn
+            .query_row("SELECT speaker, speaker_confidence FROM transcript_segments WHERE id = 's3'", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert!(s3_speaker.is_none());
+        assert!(s3_conf.is_none());
+    }
+
 }

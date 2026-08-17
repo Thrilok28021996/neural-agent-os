@@ -21,6 +21,7 @@ pub fn get_fallback_chain(
     workspace_id: &str,
     capability: &str,
 ) -> Result<FallbackChain, String> {
+    log::debug!("fallback::get_fallback_chain: enter");
     let mut statement = connection
         .prepare(
             "SELECT provider, model, priority, healthy
@@ -63,6 +64,7 @@ pub fn set_fallback_provider(
     model: &str,
     priority: u32,
 ) -> Result<(), String> {
+    log::info!("fallback::set_fallback_provider: enter");
     connection
         .execute(
             "INSERT INTO provider_fallback (workspace_id, capability, provider, model, priority, healthy)
@@ -82,6 +84,7 @@ pub fn mark_fallback_unhealthy(
     capability: &str,
     provider: &str,
 ) -> Result<(), String> {
+    log::info!("fallback::mark_fallback_unhealthy: enter");
     connection
         .execute(
             "UPDATE provider_fallback SET healthy = 0
@@ -94,12 +97,14 @@ pub fn mark_fallback_unhealthy(
 
 /// Resolve the next healthy provider for a capability, with fallback.
 /// If no fallback is configured, returns the primary route.
+#[allow(dead_code)] // tested public API (fallback resolution unit tests)
 pub fn resolve_provider(
     connection: &Connection,
     workspace_id: &str,
     capability: &str,
     primary_model: &str,
 ) -> (String, String) {
+    log::info!("fallback::resolve_provider: enter");
     // Try fallback chain first
     let chain = get_fallback_chain(connection, workspace_id, capability).ok();
     if let Some(chain) = chain {
@@ -126,6 +131,7 @@ pub fn clear_fallback_chain(
     workspace_id: &str,
     capability: &str,
 ) -> Result<(), String> {
+    log::info!("fallback::clear_fallback_chain: enter");
     connection
         .execute(
             "DELETE FROM provider_fallback WHERE workspace_id = ?1 AND capability = ?2",

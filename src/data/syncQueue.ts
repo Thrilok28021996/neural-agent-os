@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type SyncQueueItem = {
   id: string; entity_type: string; entity_id: string; provider: string; action: string

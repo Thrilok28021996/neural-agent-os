@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type ApprovalRequest = {
   id: string; agent_id: string; workspace_id: string; capability: string

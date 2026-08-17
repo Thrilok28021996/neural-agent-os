@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type MonitoredFolder = { id: string; workspace_id: string; path: string; enabled: boolean; last_checked_at?: string; files_found: number }
 

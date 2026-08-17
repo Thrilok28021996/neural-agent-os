@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type CalendarParticipant = { id: string; event_id: string; name: string; email?: string; status: string }
 export type ConflictInfo = { event_id: string; title: string; starts_at: string; ends_at: string; overlapping_event_id: string; overlapping_title: string; overlapping_starts_at: string; overlapping_ends_at: string }

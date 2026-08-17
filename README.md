@@ -4,7 +4,7 @@ Local-first desktop personal assistant. Records and processes meetings, creates 
 
 **macOS · Windows · Linux** | **Offline-first** | **No account required**
 
-> **Status (verified August 2026):** 189 Tauri commands · 80 Rust unit tests · 529 TypeScript tests passing (+18 live-API tests that run against a running app) · **99.07% real-code statement coverage / 100% lines** · macOS installer built and smoke-tested.
+> **Status (audit verified):** 196 Tauri commands · 94 Rust unit tests · 532 TypeScript tests passing (+26 live-API tests against a running app) · 196 sidebar self-test checks · `tsc`/`cargo check` clean. macOS arm64 `.app` and `.dmg` build locally; production updater signing, notarization, Windows/Linux artifacts, and cross-platform runtime testing remain outstanding.
 
 ---
 
@@ -16,7 +16,7 @@ Local-first desktop personal assistant. Records and processes meetings, creates 
 |---|---|---|
 | **Node.js 20+** | Frontend | [nodejs.org](https://nodejs.org) |
 | **Rust** | Backend | [rustup.rs](https://rustup.rs) |
-| **Ollama** (recommended) | Local AI chat, embeddings, summaries | `brew install ollama` or [ollama.com](https://ollama.com) |
+| **LM Studio** (default) | Local chat, embeddings, summaries via OpenAI-compatible server | [lmstudio.ai](https://lmstudio.ai) — serves `http://127.0.0.1:1234/v1` by default |
 | **FFmpeg** | Audio recording | `brew install ffmpeg` / `sudo apt install ffmpeg` |
 | **Whisper** (optional) | Local transcription | `pip install openai-whisper` |
 | **Playwright** (optional) | Meeting bot for Teams/Meet/Zoom | `pip install playwright && playwright install chromium` |
@@ -32,8 +32,9 @@ cd neural-agent-os
 npm install
 
 # Pull AI models (one-time)
-ollama pull qwen3:14b
-ollama pull nomic-embed-text
+> LM Studio is the default provider. Set `NEURAL_OPENAI_COMPATIBLE_MODEL` / `NEURAL_OPENAI_COMPATIBLE_EMBEDDING_MODEL`
+> to the model ids loaded in LM Studio (defaults: `qwen/qwen3.5-9b`, `text-embedding-nomic-embed-text-v1.5@q8_0`).
+> Ollama remains supported: `ollama pull qwen3:14b` / `ollama pull nomic-embed-text`.
 
 # Start the desktop app (development)
 npm run tauri dev
@@ -72,8 +73,8 @@ Isolate knowledge by context. Each workspace has its own:
 - **Citations**: every assistant answer cites its sources — including **meeting-timestamp citations** (`meeting_id` + `start_seconds`)
 
 ### Meetings
-- **Import recordings**: MP3, WAV, M4A, MP4, MOV, WebM, OGG, FLAC (single or **batch**)
-- **Local recording**: microphone or system audio via FFmpeg, with rule-engine gating and configurable notices; timestamp-named output (`~/Recordings/meeting-YYYY-MM-DD_HH-MM-SS.m4a`)
+- **Import recordings**: MP3, WAV, M4A, MP4, MOV, WebM, OGG, FLAC (single, **batch**, or **drag-and-drop** onto the window)
+- **Local recording**: microphone, system audio, or **combined mic+system** via FFmpeg, with rule-engine gating and configurable notices; timestamp-named output (`~/Recordings/meeting-YYYY-MM-DD_HH-MM-SS.m4a`); background-queue progress visible in Meetings
 - **Auto-pipeline**: when a recording stops it is automatically imported as a meeting, and its **transcription and summarization run automatically** — back-to-back recordings are queued and processed **sequentially** (one per scheduler tick) via the durable background job queue
 - **Transcription**: local Whisper or cloud (OpenAI/Google); **reprocessing** re-queues jobs
 - **Transcript editing**: correct speaker labels *and* segment text
@@ -105,6 +106,7 @@ Isolate knowledge by context. Each workspace has its own:
 - **Cloud providers**: OpenAI, Anthropic, Google, OpenCode Go plan
 - **Per-capability routing**: chat, transcription, embeddings, speech, summarization — Ask Neural, agents, summaries, and email drafts all follow the route set in Models (provider + model + API key)
 - **Provider fallback**: priority-ordered chains with health tracking and auto-skip
+- **Connection testing**: per-provider Test buttons in Models (OpenAI, Anthropic, Google, OpenAI-compatible, Ollama); rate-limit retry/backoff on cloud calls
 - **Cost tracking**: per-token pricing, cost limits, and comprehensive egress audit
 - **Token limits**: per-capability ceilings on top of cost limits
 - **Cloud data controls**: explicit toggles (`allowCloudAudio` / `allowCloudText`), offline-only mode, latency routing
@@ -125,7 +127,7 @@ Isolate knowledge by context. Each workspace has its own:
 
 ### Data Control & Privacy
 - **Local-first**: SQLite + user-selected data directory; no account, no hosted backend
-- **Backups**: full and differential, validated on creation; per-workspace retention policies
+- **Backups**: full and differential, validated on creation; per-workspace retention policies; **backup-file verification** and **retention cleanup preview** in the Data view
 - **Deletion**: impact previews, selective derived-data deletion, cascading workspace delete
 - **Retention cleanup**: recordings (30 d), sync queue (7 d), audit log (90 d), approvals (7 d)
 - **Storage stats**: database/recording sizes with 5 GB/10 GB warnings
@@ -151,6 +153,8 @@ Isolate knowledge by context. Each workspace has its own:
 | `NEURAL_OPENAI_COMPATIBLE_URL` | Local OpenAI-compatible server (LM Studio, llama.cpp, vLLM) | *(unset)* |
 | `NEURAL_WHISPER_BIN` | Whisper executable path | `whisper` |
 | `NEURAL_FFMPEG_BIN` | FFmpeg executable path | `ffmpeg` |
+| `NEURAL_DIARIZE_BIN` | Audio diarizer executable (`scripts/diarize.py`) | *(unset — text-embedding fallback)* |
+| `NEURAL_DIARIZE_HF_TOKEN` | Hugging Face token for the pyannote diarization model | *(unset)* |
 | `NEURAL_AUDIO_DEVICE` | System audio capture device | Platform-specific |
 | `NEURAL_OPENAI_API_KEY` | OpenAI API key (chat via Ask Neural/agents) | *(unset — or keychain)* |
 | `NEURAL_ANTHROPIC_API_KEY` | Anthropic API key | *(unset — or keychain)* |
@@ -185,7 +189,8 @@ npm run tauri dev           # desktop app (Tauri)
 npm run build               # production frontend (tsc -b && vite build)
 npx tauri build             # release binary + installers
 
-npm test                    # 529 TypeScript tests (+18 live-API tests)
+npm test                    # 532 TypeScript tests
+npm run test:api            # 26 live-API tests against the running app (auto-starts it)
 npm run test:coverage       # coverage (99%+ statements)
 npx tsc -b                  # type check
 cargo test --manifest-path src-tauri/Cargo.toml    # 80 Rust unit tests

@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 /** Speak text using a local TTS engine (macOS say, Linux espeak-ng, Windows SAPI) */
 export function localTextToSpeech(text: string, language?: string) {

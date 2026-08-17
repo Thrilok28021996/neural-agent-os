@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export function storeProviderSecret(provider: string, secretKind: string, value: string) {
   return invoke('store_provider_secret', { provider, secretKind, value })

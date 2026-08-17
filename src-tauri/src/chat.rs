@@ -29,7 +29,7 @@ pub fn is_cloud_provider(provider: &str) -> bool {
 }
 
 /// Resolve the workspace provider for a capability (falls back to ollama).
-fn routed_provider(connection: &Connection, workspace_id: &str, capability: &str) -> String {
+pub(crate) fn routed_provider(connection: &Connection, workspace_id: &str, capability: &str) -> String {
     connection
         .query_row(
             "SELECT provider FROM model_routes WHERE workspace_id = ?1 AND capability = ?2",
@@ -37,12 +37,12 @@ fn routed_provider(connection: &Connection, workspace_id: &str, capability: &str
             |row| row.get::<_, String>(0),
         )
         .map(|p| normalize_provider(&p))
-        .unwrap_or_else(|_| "ollama".to_string())
+        .unwrap_or_else(|_| "openai_compatible".to_string()) // default: LM Studio / local OpenAI-compatible
 }
 
 /// Get the API key for a cloud provider: environment variable first, then the
 /// OS keychain (stored via store_provider_secret as `<provider>:api_key`).
-fn provider_api_key(provider: &str) -> Result<String, String> {
+pub(crate) fn provider_api_key(provider: &str) -> Result<String, String> {
     let env_name = match provider {
         "openai" => "NEURAL_OPENAI_API_KEY",
         "anthropic" => "NEURAL_ANTHROPIC_API_KEY",
@@ -75,26 +75,41 @@ fn chat_ollama(model: &str, prompt: &str) -> Result<String, String> {
         .post(&endpoint)
         .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": false }))
         .send()
-        .map_err(|e| format!("Ollama is unavailable at {endpoint}: {e}. Start Ollama and pull the configured model."))?
+        .map_err(|e| { log::error!("chat_ollama: request to {endpoint} failed: {e}"); format!("Ollama is unavailable at {endpoint}: {e}. Start Ollama and pull the configured model.") })?
         .error_for_status()
-        .map_err(|e| e.to_string())?
+        .map_err(|e| { log::error!("chat_ollama: HTTP error from {endpoint} for model {model}: {e}"); e.to_string() })?
         .json::<crate::OllamaResponse>()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| { log::error!("chat_ollama: bad JSON from {endpoint}: {e}"); e.to_string() })?;
     Ok(response.response)
+}
+
+
+
+/// Retry once on 5xx / 429 (rate limit) responses with a short backoff.
+fn send_with_retry<F>(send: F) -> Result<reqwest::blocking::Response, String>
+where
+    F: Fn() -> Result<reqwest::blocking::Response, reqwest::Error>,
+{
+    let first = send().map_err(|e| e.to_string())?;
+    if first.status().is_server_error() || first.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        std::thread::sleep(std::time::Duration::from_millis(800));
+        send().map_err(|e| e.to_string())
+    } else {
+        Ok(first)
+    }
 }
 
 fn chat_openai(model: &str, prompt: &str) -> Result<String, String> {
     let api_key = provider_api_key("openai")?;
-    let response = reqwest::blocking::Client::new()
-        .post("https://api.openai.com/v1/chat/completions")
+    let client = reqwest::blocking::Client::new();
+    let response = send_with_retry(|| client.post("https://api.openai.com/v1/chat/completions")
         .bearer_auth(&api_key)
         .json(&serde_json::json!({
             "model": model,
             "messages": [{ "role": "user", "content": prompt }],
             "temperature": 0.7,
         }))
-        .send()
-        .map_err(|e| format!("OpenAI API error: {e}"))?
+        .send())?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json::<serde_json::Value>()
@@ -107,8 +122,8 @@ fn chat_openai(model: &str, prompt: &str) -> Result<String, String> {
 
 fn chat_anthropic(model: &str, prompt: &str) -> Result<String, String> {
     let api_key = provider_api_key("anthropic")?;
-    let response = reqwest::blocking::Client::new()
-        .post("https://api.anthropic.com/v1/messages")
+    let client = reqwest::blocking::Client::new();
+    let response = send_with_retry(|| client.post("https://api.anthropic.com/v1/messages")
         .header("x-api-key", &api_key)
         .header("anthropic-version", "2023-06-01")
         .json(&serde_json::json!({
@@ -116,8 +131,7 @@ fn chat_anthropic(model: &str, prompt: &str) -> Result<String, String> {
             "max_tokens": 2048,
             "messages": [{ "role": "user", "content": prompt }],
         }))
-        .send()
-        .map_err(|e| format!("Anthropic API error: {e}"))?
+        .send())?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json::<serde_json::Value>()
@@ -133,11 +147,10 @@ fn chat_google(model: &str, prompt: &str) -> Result<String, String> {
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={api_key}"
     );
-    let response = reqwest::blocking::Client::new()
-        .post(&url)
+    let client = reqwest::blocking::Client::new();
+    let response = send_with_retry(|| client.post(&url)
         .json(&serde_json::json!({ "contents": [{ "parts": [{ "text": prompt }] }] }))
-        .send()
-        .map_err(|e| format!("Google API error: {e}"))?
+        .send())?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json::<serde_json::Value>()
@@ -158,19 +171,21 @@ fn chat_openai_compatible(model: &str, prompt: &str) -> Result<String, String> {
     } else {
         format!("{base}/chat/completions")
     };
-    let mut request = reqwest::blocking::Client::new().post(&url);
-    if let Ok(key) = provider_api_key("openai_compatible") {
-        request = request.bearer_auth(&key);
-    }
-    let response = request
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "stream": false,
-            "temperature": 0.7,
-        }))
-        .send()
-        .map_err(|e| format!("OpenAI-compatible endpoint {url} unreachable: {e}. Set NEURAL_OPENAI_COMPATIBLE_URL to your LM Studio / llama.cpp / vLLM server."))?
+    let client = reqwest::blocking::Client::new();
+    let json_body = serde_json::json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "stream": false,
+        "temperature": 0.7,
+    });
+    let response = send_with_retry(|| {
+        let mut req = client.post(&url);
+        if let Ok(key) = provider_api_key("openai_compatible") {
+            req = req.bearer_auth(&key);
+        }
+        req.json(&json_body).send()
+    })
+    .map_err(|e| format!("OpenAI-compatible endpoint {url} unreachable: {e}. Set NEURAL_OPENAI_COMPATIBLE_URL to your LM Studio / llama.cpp / vLLM server."))?
         .error_for_status()
         .map_err(|e| e.to_string())?
         .json::<serde_json::Value>()
@@ -192,6 +207,7 @@ pub fn chat_completion(
 ) -> Result<String, String> {
     let provider = routed_provider(connection, workspace_id, capability);
     let model = crate::routed_model(connection, workspace_id, capability, fallback_model);
+    log::info!("chat_completion: workspace={workspace_id} capability={capability} provider={provider} model={model} prompt_chars={}", prompt.len());
 
     // Cost-limit gate for cloud providers (local runtimes are free).
     if is_cloud_provider(&provider) {
@@ -212,6 +228,7 @@ pub fn chat_completion(
         "openai_compatible" => chat_openai_compatible(&model, prompt)?,
         _ => chat_ollama(&model, prompt)?,
     };
+    log::info!("chat_completion: {provider}/{model} returned {} chars", response.len());
 
     // Cost tracking + comprehensive egress audit for cloud providers.
     if is_cloud_provider(&provider) {
@@ -285,6 +302,6 @@ mod tests {
         // network, so we only verify resolution helpers.
         assert_eq!(routed_provider(&conn, "w1", "chat"), "openai");
         assert_eq!(crate::routed_model(&conn, "w1", "chat", "qwen3:14b"), "gpt-4o-mini");
-        assert_eq!(routed_provider(&conn, "w1", "embeddings"), "ollama"); // unset -> default
+        assert_eq!(routed_provider(&conn, "w1", "embeddings"), "openai_compatible"); // unset -> LM Studio default
     }
 }

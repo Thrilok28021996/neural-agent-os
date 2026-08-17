@@ -1,4 +1,4 @@
-import { invoke } from '@tauri-apps/api/core'
+import { invoke } from './invoke'
 
 export type Note = { id: string; workspace_id: string; title: string; content: string; created_at: string; updated_at: string }
 

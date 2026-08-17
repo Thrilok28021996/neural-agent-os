@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-#[derive(Serialize)]
+#[derive(serde::Serialize, Debug, Clone)]
 pub struct CalendarParticipant {
     pub id: String,
     pub event_id: String,
@@ -29,6 +29,20 @@ pub fn add_participant(
     name: &str,
     email: Option<&str>,
 ) -> Result<CalendarParticipant, String> {
+    log::info!("calendar_extras::add_participant: enter event_id={event_id}");
+    // Validate the event exists so a stale/deleted event yields a clear error
+    // instead of a raw "FOREIGN KEY constraint failed".
+    let event_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE id = ?1)",
+        params![event_id], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    if !event_exists {
+        log::warn!("calendar_extras::add_participant: event {event_id} does not exist");
+        return Err(format!("Calendar event {event_id} no longer exists — refresh the calendar and try again"));
+    }
+    if name.trim().is_empty() {
+        return Err("Participant name is required".into());
+    }
     let id = format!("participant-{}", uuid::Uuid::new_v4());
     connection
         .execute(
@@ -51,6 +65,7 @@ pub fn list_participants(
     connection: &Connection,
     event_id: &str,
 ) -> Result<Vec<CalendarParticipant>, String> {
+    log::debug!("calendar_extras::list_participants: enter");
     let mut statement = connection
         .prepare(
             "SELECT id, event_id, name, email, status
@@ -80,6 +95,7 @@ pub fn update_participant_status(
     participant_id: &str,
     status: &str,
 ) -> Result<(), String> {
+    log::info!("calendar_extras::update_participant_status: enter");
     if !["invited", "accepted", "declined", "tentative"].contains(&status) {
         return Err("Invalid participant status".into());
     }
@@ -97,6 +113,7 @@ pub fn remove_participant(
     connection: &Connection,
     participant_id: &str,
 ) -> Result<(), String> {
+    log::info!("calendar_extras::remove_participant: enter");
     connection
         .execute(
             "DELETE FROM calendar_participants WHERE id = ?1",
@@ -114,23 +131,7 @@ pub fn detect_conflicts(
     ends_at: &str,
     exclude_event_id: Option<&str>,
 ) -> Result<Vec<ConflictInfo>, String> {
-    let mut sql = String::from(
-        "SELECT e1.id, e1.title, e1.starts_at, e1.ends_at,
-         e2.id, e2.title, e2.starts_at, e2.ends_at
-         FROM calendar_events e1
-         JOIN calendar_events e2 ON e1.workspace_id = e2.workspace_id
-         WHERE e1.workspace_id = ?1
-         AND e1.starts_at >= ?2 AND e1.ends_at <= ?3
-         AND e1.id != e2.id
-         AND e2.starts_at < e1.ends_at
-         AND e2.ends_at > e1.starts_at",
-    );
-
-    let params_arr: Vec<Box<dyn rusqlite::types::ToSql>> = vec![
-        Box::new(workspace_id.to_string()),
-        Box::new(starts_at.to_string()),
-        Box::new(ends_at.to_string()),
-    ];
+    log::info!("calendar_extras::detect_conflicts: enter");
     // Simple approach: check for overlaps with all events in range
     let mut statement = connection
         .prepare(
@@ -191,6 +192,7 @@ pub fn check_conflicts_for_event(
     workspace_id: &str,
     event_id: &str,
 ) -> Result<Vec<ConflictInfo>, String> {
+    log::debug!("calendar_extras::check_conflicts_for_event: enter");
     let (starts_at, ends_at): (String, String) = connection
         .query_row(
             "SELECT starts_at, ends_at FROM calendar_events WHERE id = ?1",
@@ -207,6 +209,7 @@ pub fn generate_ics_content(
     connection: &Connection,
     event_id: &str,
 ) -> Result<String, String> {
+    log::info!("calendar_extras::generate_ics_content: enter");
     let (title, starts_at, ends_at, meeting_url, recurrence): (String, String, String, Option<String>, Option<String>) = connection
         .query_row(
             "SELECT title, starts_at, ends_at, meeting_url, recurrence FROM calendar_events WHERE id = ?1",
@@ -267,7 +270,7 @@ pub fn generate_ics_content(
 
 /// Send calendar invitation email to a participant.
 /// Returns the invitation body text for audit.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, Debug)]
 pub struct InvitationResult {
     pub participant_id: String,
     pub sent_to: String,
@@ -279,13 +282,24 @@ pub fn send_invitation(
     event_id: &str,
     participant_id: &str,
 ) -> Result<InvitationResult, String> {
+    log::info!("calendar_extras::send_invitation: enter event_id={event_id} participant_id={participant_id}");
+    // Validate both rows exist up front: missing rows previously surfaced as a
+    // raw "FOREIGN KEY constraint failed".
+    let event_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM calendar_events WHERE id = ?1)",
+        params![event_id], |row| row.get(0),
+    ).map_err(|e| e.to_string())?;
+    if !event_exists {
+        log::warn!("calendar_extras::send_invitation: event {event_id} does not exist");
+        return Err(format!("Calendar event {event_id} no longer exists — refresh the calendar and try again"));
+    }
     let (name, email): (String, Option<String>) = connection
         .query_row(
             "SELECT name, email FROM calendar_participants WHERE id = ?1",
             params![participant_id],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| if e == rusqlite::Error::QueryReturnedNoRows { format!("Participant {participant_id} no longer exists — refresh the calendar and try again") } else { e.to_string() })?;
 
     let email_addr = email.ok_or("Participant has no email address")?;
 
@@ -297,14 +311,6 @@ pub fn send_invitation(
         )
         .map_err(|e| e.to_string())?;
 
-    let invite_body = format!(
-        "You are invited to: {}\nWhen: {} to {}\n{}\n\nPlease respond to this invitation.",
-        title,
-        starts_at,
-        ends_at,
-        meeting_url.map(|u| format!("Meeting link: {}", u)).unwrap_or_default()
-    );
-
     // Audit the invitation
     super::retention::record_audit(
         connection,
@@ -312,7 +318,15 @@ pub fn send_invitation(
         None,
         Some("calendar"),
         None,
-        &format!("Invitation sent to {} ({}) for event: {}", name, email_addr, title),
+        &format!(
+            "Invitation sent to {} ({}) for event: {} ({} to {}{})",
+            name,
+            email_addr,
+            title,
+            starts_at,
+            ends_at,
+            meeting_url.map(|u| format!(", link: {u}")).unwrap_or_default()
+        ),
     )?;
 
     // Update participant status to track that invitation was sent
@@ -336,6 +350,7 @@ pub fn process_rsvp(
     participant_id: &str,
     response: &str,
 ) -> Result<(), String> {
+    log::info!("calendar_extras::process_rsvp: enter");
     let status = match response.to_lowercase().as_str() {
         "accept" | "accepted" | "yes" => "accepted",
         "decline" | "declined" | "no" => "declined",
@@ -360,4 +375,37 @@ pub fn process_rsvp(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn conn() -> rusqlite::Connection {
+        crate::tests::test_connection()
+    }
+
+    /// A stale/deleted event must produce a clear error, never a raw
+    /// "FOREIGN KEY constraint failed".
+    #[test]
+    fn add_participant_rejects_missing_event_cleanly() {
+        let connection = conn();
+        connection.execute("INSERT INTO workspaces (id, name) VALUES ('w1', 'Work')", []).unwrap();
+        let err = add_participant(&connection, "event-does-not-exist", "Alice", None).unwrap_err();
+        assert!(err.contains("no longer exists"), "got: {err}");
+        // And a valid event still works.
+        connection.execute("INSERT INTO calendar_events (id, workspace_id, title, starts_at, ends_at, provider) VALUES ('e1', 'w1', 'Sync', '2026-08-16T09:00:00Z', '2026-08-16T10:00:00Z', 'local')", []).unwrap();
+        let participant = add_participant(&connection, "e1", "Alice", None).unwrap();
+        assert_eq!(participant.name, "Alice");
+        // Empty name is rejected too.
+        assert!(add_participant(&connection, "e1", "   ", None).is_err());
+    }
+
+    #[test]
+    fn send_invitation_rejects_missing_event_and_participant_cleanly() {
+        let connection = conn();
+        connection.execute("INSERT INTO workspaces (id, name) VALUES ('w1', 'Work')", []).unwrap();
+        let err = send_invitation(&connection, "event-missing", "participant-missing").unwrap_err();
+        assert!(err.contains("no longer exists"), "got: {err}");
+    }
 }

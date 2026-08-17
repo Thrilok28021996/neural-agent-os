@@ -1,5 +1,5 @@
 use serde::{Serialize, Deserialize};
-use rusqlite::Connection;
+
 
 #[derive(Serialize)]
 pub struct OAuthConfig {
@@ -28,6 +28,7 @@ const PRECONFIGURED_CLIENTS: &[(&str, &str, &str)] = &[
 /// Get preconfigured OAuth config for a provider.
 /// Falls back to environment variables if preconfigured client is unavailable.
 pub fn get_oauth_config(provider: &str) -> Result<OAuthConfig, String> {
+    log::debug!("oauth::get_oauth_config: enter");
     let env_client_id = match provider {
         "google" => std::env::var("NEURAL_GOOGLE_CLIENT_ID").ok(),
         "outlook" => std::env::var("NEURAL_MICROSOFT_CLIENT_ID").ok(),
@@ -81,6 +82,7 @@ pub fn get_oauth_config(provider: &str) -> Result<OAuthConfig, String> {
 
 /// Generate PKCE code verifier and challenge
 pub fn generate_pkce() -> PKCEParams {
+    log::info!("oauth::generate_pkce: enter");
     use rand::Rng;
 
     // Code verifier: 128 random URL-safe chars
@@ -128,6 +130,7 @@ fn base64_url_encode(input: &[u8]) -> String {
 
 /// Build the full authorization URL with PKCE
 pub fn build_authorize_url(provider: &str, pkce: &PKCEParams) -> Result<String, String> {
+    log::info!("oauth::build_authorize_url: enter");
     let config = get_oauth_config(provider)?;
     let scope = config.scopes.join(" ");
     let url = format!(
@@ -146,6 +149,7 @@ pub fn exchange_code_with_pkce(
     code: &str,
     pkce: &PKCEParams,
 ) -> Result<(String, String), String> {
+    log::info!("oauth::exchange_code_with_pkce: enter");
     let config = get_oauth_config(provider)?;
     let client_secret = match provider {
         "google" => std::env::var("NEURAL_GOOGLE_CLIENT_SECRET").unwrap_or_default(),
@@ -205,6 +209,7 @@ pub fn exchange_code_with_pkce(
 
 /// Refresh an access token using the stored refresh token
 pub fn refresh_access_token(provider: &str) -> Result<String, String> {
+    log::info!("oauth::refresh_access_token: enter");
     let config = get_oauth_config(provider)?;
     let client_secret = match provider {
         "google" => std::env::var("NEURAL_GOOGLE_CLIENT_SECRET").unwrap_or_default(),
