@@ -112,13 +112,7 @@ jobs:
         run: npm ci
 
       - name: Build Tauri app
-        id: tauri
-        uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tauriScript: npx tauri
-          args: '--config {"bundle":{"createUpdaterArtifacts":false}}'
+        run: npx tauri build --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload macOS artifacts
         if: matrix.platform.os == 'macos'
