@@ -117,4 +117,4 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tauriScript: npx tauri
-          args: '--config bundle.createUpdaterArtifacts=false' 
+          args: '--config {"bundle":{"createUpdaterArtifacts":false}}'
