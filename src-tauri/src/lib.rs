@@ -5011,6 +5011,7 @@ fn get_provider_health(app: tauri::AppHandle, workspace_id: String) -> Result<Ve
 
 #[tauri::command]
 fn local_text_to_speech(text: String, language: Option<String>) -> Result<String, String> {
+    #[allow(unused_variables)]
     let lang = language.unwrap_or_else(|| "en".into());
     // Try platform-native TTS engines. We BLOCK until speech finishes so the
     // caller knows exactly when the voice stopped (prevents the mic re-opening
